@@ -50,6 +50,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -67,6 +68,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.PlaylistEntity
 import com.example.data.model.PlaylistFolderEntity
+import com.example.cover.PlaylistCoverGenerator
 import com.example.ui.MainViewModel
 import com.example.ui.components.BatchPlaylistActionBar
 import com.example.ui.components.CreateFolderDialog
@@ -97,7 +99,10 @@ fun LibraryScreen(
     val allMissingTracks by viewModel.allMissingTracks.collectAsState()
     val playlistSortOrder by viewModel.playlistSortOrder.collectAsState()
     val selectedPlaylistIds by viewModel.selectedPlaylistIds.collectAsState()
+    val selectedFolderIds by viewModel.selectedFolderIds.collectAsState()
     val isMultiSelectMode by viewModel.isMultiSelectMode.collectAsState()
+    val isPlaylistMultiSelectActive by viewModel.isPlaylistMultiSelectActive.collectAsState()
+    val isFolderMultiSelectActive by viewModel.isFolderMultiSelectActive.collectAsState()
     val playlistSongCounts by viewModel.playlistSongCounts.collectAsState()
 
     var currentFolderId by remember { mutableStateOf<String?>(null) }
@@ -116,6 +121,10 @@ fun LibraryScreen(
     var showBatchDeleteConfirm by remember { mutableStateOf(false) }
     var newPlaylistName by remember { mutableStateOf("") }
 
+    LaunchedEffect(allFolders, allPlaylists) {
+        viewModel.ensureFolderCovers()
+    }
+
     val displayedPlaylists = remember(allPlaylists, currentFolderId, playlistSortOrder) {
         val filtered = if (currentFolderId == null) {
             allPlaylists.filter { it.folderId == null }
@@ -125,7 +134,7 @@ fun LibraryScreen(
         SortUtils.sortPlaylists(filtered, playlistSortOrder)
     }
 
-    // Import multiple / single files (TXT or CSV)
+    // Import normal playlist CSV files or folder-aware backup ZIP files
     val importFilesLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris: List<Uri> ->
@@ -141,24 +150,12 @@ fun LibraryScreen(
 
                 val inputStream = context.contentResolver.openInputStream(uri)
                 if (inputStream != null) {
-                    if (fileName.endsWith(".txt", ignoreCase = true)) {
-                        viewModel.importTxt(fileName, inputStream)
-                    } else {
-                        viewModel.importCsv(fileName, inputStream)
-                    }
+                    viewModel.importPlaylistOrFolderFile(fileName, inputStream)
                 }
             }
         }
     }
 
-    // Import whole folder tree (detects all CSV and TXT files inside folder)
-    val importFolderTreeLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
-    ) { treeUri: Uri? ->
-        if (treeUri != null) {
-            viewModel.importPlaylistsFromFolderTree(treeUri)
-        }
-    }
 
     Box(modifier = modifier.fillMaxSize()) {
         LazyColumn(
@@ -256,7 +253,7 @@ fun LibraryScreen(
                                         }
                                     )
                                     DropdownMenuItem(
-                                        text = { Text("Create Playlist Folder (Spotify style)", color = SpotifyPrimaryText) },
+                                        text = { Text("Create Playlist Folder", color = SpotifyPrimaryText) },
                                         leadingIcon = { Icon(Icons.Default.CreateNewFolder, contentDescription = null, tint = SpotifyGreen) },
                                         onClick = {
                                             showOptionsMenu = false
@@ -264,19 +261,17 @@ fun LibraryScreen(
                                         }
                                     )
                                     DropdownMenuItem(
-                                        text = { Text("Import Files (TXT / CSV)", color = SpotifyPrimaryText) },
+                                        text = { Text("Import Playlist CSV / Folder ZIP", color = SpotifyPrimaryText) },
                                         leadingIcon = { Icon(Icons.Default.Download, contentDescription = null, tint = SpotifyPrimaryText) },
                                         onClick = {
                                             showOptionsMenu = false
-                                            importFilesLauncher.launch(arrayOf("text/*", "*/*"))
-                                        }
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text("Import Whole Folder of Playlists", color = SpotifyPrimaryText) },
-                                        leadingIcon = { Icon(Icons.Default.DriveFolderUpload, contentDescription = null, tint = SpotifyPrimaryText) },
-                                        onClick = {
-                                            showOptionsMenu = false
-                                            importFolderTreeLauncher.launch(null)
+                                            importFilesLauncher.launch(arrayOf(
+                                                "text/csv",
+                                                "text/comma-separated-values",
+                                                "application/csv",
+                                                "application/zip",
+                                                "application/x-zip-compressed"
+                                            ))
                                         }
                                     )
                                      DropdownMenuItem(
@@ -291,21 +286,6 @@ fun LibraryScreen(
                                         onClick = {
                                             showOptionsMenu = false
                                             viewModel.retryMissingMatchesForAllPlaylists()
-                                        }
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text("Check Local Files on Device", color = SpotifySecondaryText) },
-                                        onClick = {
-                                            showOptionsMenu = false
-                                            viewModel.checkLocalFilesExistence()
-                                            Toast.makeText(context, "Scanned and verified local music files", Toast.LENGTH_SHORT).show()
-                                        }
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text("Restore / Backup Data", color = SpotifySecondaryText) },
-                                        onClick = {
-                                            showOptionsMenu = false
-                                            viewModel.openSettings()
                                         }
                                     )
                                 }
@@ -375,13 +355,34 @@ fun LibraryScreen(
             // Playlist Folders Section (Only at Root)
             if (currentFolderId == null && allFolders.isNotEmpty()) {
                 item {
-                    Text(
-                        text = "Folders (${allFolders.size})",
-                        color = SpotifySecondaryText,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
-                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Folders (${allFolders.size})",
+                            color = SpotifySecondaryText,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        IconButton(
+                            onClick = {
+                                if (isFolderMultiSelectActive) viewModel.clearFolderSelection()
+                                else viewModel.startFolderSelection()
+                            },
+                            modifier = Modifier.testTag("folder_multiselect_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Checklist,
+                                contentDescription = "Select Folders",
+                                tint = if (isFolderMultiSelectActive) SpotifyGreen else SpotifySecondaryText,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
                 }
 
                 items(allFolders) { folder ->
@@ -389,6 +390,14 @@ fun LibraryScreen(
                     PlaylistFolderListItem(
                         folder = folder,
                         playlistCount = count,
+                        coverPath = PlaylistCoverGenerator.folderCoverPath(context, folder.id),
+                        isMultiSelectMode = isFolderMultiSelectActive,
+                        isSelected = selectedFolderIds.contains(folder.id),
+                        onSelectToggle = { viewModel.toggleFolderSelection(folder.id) },
+                        onLongClick = {
+                            if (!isFolderMultiSelectActive) viewModel.startFolderSelection(folder.id)
+                            else viewModel.toggleFolderSelection(folder.id)
+                        },
                         onClick = { currentFolderId = folder.id },
                         onRenameClick = {
                             renameFolderTarget = folder
@@ -453,7 +462,7 @@ fun LibraryScreen(
                 PlaylistListItem(
                     playlist = playlist,
                     songCount = playlistSongCounts[playlist.id] ?: 0,
-                    isMultiSelectMode = isMultiSelectMode,
+                    isMultiSelectMode = isPlaylistMultiSelectActive,
                     isSelected = isSelected,
                     onSelectToggle = { checked ->
                         viewModel.togglePlaylistSelection(playlist.id)
@@ -462,14 +471,39 @@ fun LibraryScreen(
                         viewModel.setMultiSelectMode(true)
                         viewModel.togglePlaylistSelection(playlist.id)
                     },
-                    onClick = { viewModel.openPlaylist(playlist) }
+                    onClick = { viewModel.openPlaylist(playlist) },
+                    onTogglePin = { viewModel.setPlaylistPinned(playlist.id, !playlist.isPinned) },
+                    onMoveToFolder = {
+                        playlistToMove = playlist
+                    }
                 )
             }
         }
 
+        // Batch Folder Backup Action Bar
+        if (isFolderMultiSelectActive && selectedFolderIds.isNotEmpty()) {
+            BatchFolderActionBar(
+                selectedCount = selectedFolderIds.size,
+                totalCount = allFolders.size,
+                onSelectAll = {
+                    if (selectedFolderIds.size == allFolders.size) {
+                        viewModel.clearFolderSelection()
+                    } else {
+                        viewModel.selectAllFolders(allFolders.map { it.id })
+                    }
+                },
+                onClearSelection = { viewModel.clearFolderSelection() },
+                onBackup = { viewModel.backupSelectedFolders(context) },
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+        }
+
         // Batch Playlist Action Bar
-        if (isMultiSelectMode && selectedPlaylistIds.isNotEmpty()) {
+        if (!isFolderMultiSelectActive && isPlaylistMultiSelectActive && selectedPlaylistIds.isNotEmpty()) {
             val allIds = displayedPlaylists.map { it.id }
+            val allSelectedPinned = selectedPlaylistIds
+                .mapNotNull { id -> allPlaylists.firstOrNull { it.id == id } }
+                .all { it.isPinned }
             BatchPlaylistActionBar(
                 selectedCount = selectedPlaylistIds.size,
                 totalCount = allIds.size,
@@ -482,7 +516,12 @@ fun LibraryScreen(
                 },
                 onClearSelection = { viewModel.clearSelection() },
                 onMoveToFolder = { showBatchMoveFolderDialog = true },
-                onLikeAllSongs = { viewModel.batchLikeSongsOfSelectedPlaylists() },
+                onTogglePin = {
+                    selectedPlaylistIds.forEach { id ->
+                        viewModel.setPlaylistPinned(id, !allSelectedPinned)
+                    }
+                },
+                isAllPinned = allSelectedPinned,
                 onExportPlaylists = {
                     viewModel.exportSelectedPlaylistsAsZip(context)
                 },

@@ -26,7 +26,6 @@ import com.example.util.ImportedManifestManager
 import com.example.util.NormalizationUtils
 import com.example.util.PlaylistSortOrder
 import com.example.util.SongSortOrder
-import com.example.util.TxtPlaylistUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -40,6 +39,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
+import java.io.FileOutputStream
 
 data class DuplicatePrompt(
     val rawFileName: String,
@@ -56,6 +56,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // SharedPreferences for folder sources and Spotify-like playback preferences
     private val prefs = context.getSharedPreferences("music_sources_prefs", Context.MODE_PRIVATE)
+
+    private val lastPlaylistIdKey = "last_used_playlist_id"
 
     // Hide unplayable songs (like Spotify local files)
     private val _hideUnplayableSongs = MutableStateFlow(prefs.getBoolean("hide_unplayable_songs", false))
@@ -151,6 +153,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val repeatMode = playerManager.repeatMode
     val queue = playerManager.queue
 
+
     private val _isFullPlayerExpanded = MutableStateFlow(false)
     val isFullPlayerExpanded: StateFlow<Boolean> = _isFullPlayerExpanded.asStateFlow()
 
@@ -161,17 +164,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
-    val filteredTracks: StateFlow<List<TrackEntity>> = combine(allTracks, searchQuery) { tracks, query ->
-        if (query.isBlank()) tracks
-        else {
-            val q = NormalizationUtils.normalizeText(query)
-            tracks.filter {
-                NormalizationUtils.normalizeText(it.title).contains(q) ||
-                        NormalizationUtils.normalizeText(it.artist).contains(q) ||
-                        NormalizationUtils.normalizeText(it.album).contains(q)
+    val filteredTracks: StateFlow<List<TrackEntity>> =
+        combine(allTracks, searchQuery) { tracks, query ->
+            if (query.isBlank()) {
+                tracks
+            } else {
+                val q = NormalizationUtils.normalizeText(query)
+                tracks.filter {
+                    NormalizationUtils.normalizeText(it.title).contains(q) ||
+                            NormalizationUtils.normalizeText(it.artist).contains(q) ||
+                            NormalizationUtils.normalizeText(it.album).contains(q)
+                }
             }
-        }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     // Dialog and Sheet States
     private val _statusMessage = MutableStateFlow<String?>(null)
@@ -224,6 +229,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _isPlaylistMultiSelectActive = MutableStateFlow(false)
     val isPlaylistMultiSelectActive: StateFlow<Boolean> = _isPlaylistMultiSelectActive.asStateFlow()
 
+    // Multi-Select for Playlist Folders
+    private val _selectedFolderIds = MutableStateFlow<Set<String>>(emptySet())
+    val selectedFolderIds: StateFlow<Set<String>> = _selectedFolderIds.asStateFlow()
+
+    private val _isFolderMultiSelectActive = MutableStateFlow(false)
+    val isFolderMultiSelectActive: StateFlow<Boolean> = _isFolderMultiSelectActive.asStateFlow()
+
     // Sorting State
     private val _songSortOrder = MutableStateFlow(SongSortOrder.CUSTOM)
     val songSortOrder: StateFlow<SongSortOrder> = _songSortOrder.asStateFlow()
@@ -241,11 +253,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val playlistDuplicates: StateFlow<List<DuplicateGroup>> = _playlistDuplicates.asStateFlow()
     val activePlaylistDuplicates: StateFlow<List<DuplicateGroup>> = _playlistDuplicates.asStateFlow()
 
-    val isMultiSelectMode: StateFlow<Boolean> = combine(_isSongMultiSelectActive, _isPlaylistMultiSelectActive) { song, pl ->
-        song || pl
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+    val isMultiSelectMode: StateFlow<Boolean> = combine(
+        combine(_isSongMultiSelectActive, _isPlaylistMultiSelectActive) { song, pl -> song || pl },
+        _isFolderMultiSelectActive
+    ) { songsOrPlaylists, folders -> songsOrPlaylists || folders }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     init {
+        // Ensure the conventional, easy-to-find shared Music folder exists when the device permits it.
+        try {
+            val musicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
+            if (!musicDir.exists()) musicDir.mkdirs()
+        } catch (_: Exception) {
+            // Scoped-storage/OEM rules may block direct creation; scanning remains available.
+        }
+
         // Startup: clean any previously injected synthetic demo tracks so only real local music is used!
         viewModelScope.launch(Dispatchers.IO) {
             val all = database.trackDao().getAllTracksSnapshot()
@@ -463,6 +485,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 }
+                if (likedCount > 0) {
+                    deduplicateLikedSongs()
+                }
                 withContext(Dispatchers.Main) {
                     _statusMessage.value = "Added $likedCount songs from selected playlists to Liked Songs!"
                     clearSelection()
@@ -482,54 +507,109 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _statusMessage.value = "No playlists selected to export"
             return
         }
+
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Ensure the public downloads backup directory exists
-                val backupDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "LocalMusicBackups")
-                if (!backupDir.exists()) {
-                    backupDir.mkdirs()
-                }
-                // Fallback direct path creation
-                val directBackupDir = File("/storage/emulated/0/Download/LocalMusicBackups")
-                if (!directBackupDir.exists()) {
-                    directBackupDir.mkdirs()
-                }
+                val backupDir = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "LocalMusicBackups"
+                ).apply { mkdirs() }
 
-                val finalDir = if (backupDir.exists()) backupDir else directBackupDir
+                val timestamp = java.text.SimpleDateFormat(
+                    "yyyyMMdd_HHmmss",
+                    java.util.Locale.getDefault()
+                ).format(java.util.Date())
 
-                val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault()).format(java.util.Date())
-                val zipFile = File(finalDir, "Playlists_Backup_$timestamp.zip")
-
+                val zipFile = File(backupDir, "Playlists_Backup_$timestamp.zip")
                 val allTracksMap = allTracks.value.associateBy { it.id }
+                val selectedPlaylists = selected.mapNotNull { database.playlistDao().getPlaylistById(it) }
+                val allFolders = database.playlistFolderDao().getAllFoldersSnapshot()
+                val folderMap = allFolders.associateBy { it.id }
 
                 java.util.zip.ZipOutputStream(java.io.FileOutputStream(zipFile)).use { zipOut ->
-                    for (playlistId in selected) {
-                        val playlist = database.playlistDao().getPlaylistById(playlistId) ?: continue
-                        val entries = database.playlistDao().getPlaylistEntriesSnapshot(playlistId)
-                        
-                        // Sanitize filename to avoid any invalid chars
-                        val safeName = playlist.name.replace("[\\\\/:*?\"<>|]".toRegex(), "_")
-                        val entryName = "$safeName.txt"
-
-                        val txtContent = buildString {
-                            for (entry in entries) {
-                                val track = entry.trackId?.let { allTracksMap[it] }
-                                val artist = track?.artist ?: entry.csvArtist
-                                val title = track?.title ?: entry.csvTitle
-                                val duration = track?.durationMs ?: entry.csvDurationMs
-                                appendLine("$artist:$title:$duration")
-                            }
+                    val folderMeta = org.json.JSONArray()
+                    allFolders
+                        .filter { folder -> selectedPlaylists.any { it.folderId == folder.id } }
+                        .forEach { folder ->
+                            folderMeta.put(org.json.JSONObject().apply {
+                                put("id", folder.id)
+                                put("name", folder.name)
+                                put("createdAt", folder.createdAt)
+                                put("isPinned", folder.isPinned)
+                            })
                         }
 
-                        val zipEntry = java.util.zip.ZipEntry(entryName)
+                    writeZipTextEntry(
+                        zipOut,
+                        "backup/folders.json",
+                        folderMeta.toString(2)
+                    )
+
+                    val playlistMeta = org.json.JSONArray()
+
+                    for (playlist in selectedPlaylists) {
+                        val entries = database.playlistDao().getPlaylistEntriesSnapshot(playlist.id)
+                        val folderName = playlist.folderId
+                            ?.let { folderMap[it]?.name }
+                            ?.takeIf { it.isNotBlank() }
+
+                        val csvRows = entries.map { entry ->
+                            val track = entry.trackId?.let { allTracksMap[it] }
+                            com.example.util.CsvTrackRow(
+                                trackName = track?.title ?: entry.csvTitle,
+                                artistNames = track?.artist ?: entry.csvArtist,
+                                albumName = track?.album ?: entry.csvAlbum,
+                                durationMs = track?.durationMs ?: entry.csvDurationMs,
+                                trackUri = entry.csvTrackUri ?: ""
+                            )
+                        }
+                        val csvContent = com.example.util.CsvUtils.exportToCsv(csvRows)
+
+                        val relativePath = if (folderName != null) {
+                            "folders/${safeZipPart(folderName)}/${safeZipPart(playlist.name)}.csv"
+                        } else {
+                            "playlists/${safeZipPart(playlist.name)}.csv"
+                        }
+
+                        val zipEntry = java.util.zip.ZipEntry(relativePath)
                         zipOut.putNextEntry(zipEntry)
-                        zipOut.write(txtContent.toByteArray(Charsets.UTF_8))
+                        zipOut.write(csvContent.toByteArray(Charsets.UTF_8))
                         zipOut.closeEntry()
+
+                        playlistMeta.put(org.json.JSONObject().apply {
+                            put("id", playlist.id)
+                            put("name", playlist.name)
+                            put("description", playlist.description)
+                            put("coverPath", playlist.coverPath ?: "")
+                            put("createdAt", playlist.createdAt)
+                            put("updatedAt", playlist.updatedAt)
+                            put("isSystemLiked", playlist.isSystemLiked)
+                            put("isPinned", playlist.isPinned)
+                            put("folderName", folderName ?: "")
+                            put("path", relativePath)
+                        })
                     }
+
+                    writeZipTextEntry(
+                        zipOut,
+                        "backup/playlists.json",
+                        playlistMeta.toString(2)
+                    )
+
+                    writeZipTextEntry(
+                        zipOut,
+                        "backup/manifest.json",
+                        org.json.JSONObject().apply {
+                            put("backupVersion", 2)
+                            put("format", "folder-aware-csv")
+                            put("playlistCount", selectedPlaylists.size)
+                            put("folderCount", folderMeta.length())
+                        }.toString(2)
+                    )
                 }
 
                 withContext(Dispatchers.Main) {
-                    _statusMessage.value = "Saved backup ZIP to ${zipFile.absolutePath}"
+                    _statusMessage.value = "Saved playlist backup ZIP to ${zipFile.absolutePath}"
                     clearSelection()
                 }
             } catch (e: Exception) {
@@ -539,6 +619,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+    }
+
+    private fun safeZipPart(value: String): String =
+        value.trim()
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .replace(Regex("[. ]+$"), "")
+            .ifBlank { "Playlist" }
+
+    private fun writeZipTextEntry(
+        zipOut: java.util.zip.ZipOutputStream,
+        path: String,
+        text: String
+    ) {
+        val entry = java.util.zip.ZipEntry(path.replace('\\', '/'))
+        zipOut.putNextEntry(entry)
+        zipOut.write(text.toByteArray(Charsets.UTF_8))
+        zipOut.closeEntry()
     }
 
     fun clearDemoLibrary() {
@@ -557,12 +654,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openPlaylist(playlist: PlaylistEntity) {
+        clearFolderSelection()
         _activePlaylist.value = playlist
         _currentScreen.value = Screen.PlaylistDetail(playlist.id)
     }
 
     fun openLikedSongs() {
+        clearFolderSelection()
         _currentScreen.value = Screen.LikedSongs
+        deduplicateLikedSongs()
+    }
+
+    private fun deduplicateLikedSongs() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val liked = database.trackDao().getAllTracksSnapshot().filter { it.isLiked }
+            if (liked.size < 2) return@launch
+
+            val seen = mutableSetOf<String>()
+            val duplicateIds = mutableListOf<String>()
+            for (track in liked.sortedWith(compareBy<TrackEntity> { it.addedAt }.thenBy { it.id })) {
+                val normalizedPath = track.filePath.trim().lowercase()
+                val key = if (normalizedPath.isNotEmpty() && !normalizedPath.startsWith("content://")) {
+                    "path:$normalizedPath"
+                } else {
+                    "meta:${NormalizationUtils.normalizeText(track.title)}|${NormalizationUtils.normalizeText(track.artist)}|${track.durationMs}"
+                }
+                if (!seen.add(key)) duplicateIds.add(track.id)
+            }
+
+            if (duplicateIds.isNotEmpty()) {
+                duplicateIds.chunked(900).forEach { database.trackDao().batchSetLiked(it, false) }
+                withContext(Dispatchers.Main) {
+                    _statusMessage.value = "Removed ${duplicateIds.size} duplicate songs from Liked Songs"
+                }
+            }
+        }
     }
 
     fun openMissingTracksScreen() {
@@ -583,6 +709,53 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setSearchQuery(query: String) {
         _searchQuery.value = query
+    }
+
+    fun ensureFolderCovers(forceRegenerate: Boolean = false) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val folders = database.playlistFolderDao().getAllFoldersSnapshot()
+                val playlists = database.playlistDao().getAllPlaylistsSnapshot()
+                for (folder in folders) {
+                    val childCovers = playlists
+                        .filter { it.folderId == folder.id }
+                        .mapNotNull { it.coverPath }
+                    if (childCovers.isNotEmpty()) {
+                        com.example.cover.PlaylistCoverGenerator.generateRandomFolderCover(
+                            context = context,
+                            folderId = folder.id,
+                            playlistCoverPaths = childCovers,
+                            forceRegenerate = forceRegenerate
+                        )
+                    }
+                }
+            } catch (_: Exception) {
+                // Folder artwork is cosmetic; never block the library.
+            }
+        }
+    }
+
+
+    fun importAppFont(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val fontsDir = File(context.filesDir, "fonts").apply { mkdirs() }
+                val name = "app_font.${context.contentResolver.getType(uri)?.substringAfter('/')?.ifBlank { "ttf" } ?: "ttf"}"
+                val target = File(fontsDir, name)
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(target).use { output -> input.copyTo(output) }
+                } ?: throw IllegalArgumentException("Unable to open font file")
+                prefs.edit().putString("custom_font_path", target.absolutePath).apply()
+                withContext(Dispatchers.Main) { _statusMessage.value = "Font imported. Restart the app to apply it everywhere." }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { _statusMessage.value = "Font import failed: ${e.message}" }
+            }
+        }
+    }
+
+    fun useSystemFont() {
+        prefs.edit().remove("custom_font_path").apply()
+        _statusMessage.value = "System font selected. Restart the app to apply it everywhere."
     }
 
     fun clearStatusMessage() {
@@ -630,6 +803,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val newLiked = !track.isLiked
         viewModelScope.launch {
             repository.setLiked(track.id, newLiked)
+            if (newLiked) deduplicateLikedSongs()
             if (currentTrack.value?.id == track.id) {
                 playerManager.toggleLikeCurrentTrack()
             }
@@ -639,9 +813,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun removeBatchFromLiked(trackIds: List<String>) {
         if (trackIds.isEmpty()) return
         viewModelScope.launch {
-            for (id in trackIds) {
-                repository.setLiked(id, false)
-            }
+            repository.batchSetLiked(trackIds, false)
             clearSongSelection()
             _statusMessage.value = "Removed ${trackIds.size} songs from Liked Songs"
         }
@@ -672,9 +844,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun createPlaylist(name: String, folderId: String? = null) {
+        val preservedName = name.trim()
+        if (preservedName.isEmpty()) return
         viewModelScope.launch {
-            val p = repository.createPlaylist(name, folderId)
+            val p = repository.createPlaylist(preservedName, folderId)
             _statusMessage.value = "Created playlist: ${p.name}"
+        }
+    }
+
+    fun createPlaylistAndAddTrack(name: String, track: TrackEntity, onDone: (() -> Unit)? = null) {
+        val preservedName = name.trim()
+        if (preservedName.isEmpty()) return
+        viewModelScope.launch {
+            val playlist = repository.createPlaylist(preservedName, null)
+            repository.batchAddTracksToPlaylist(playlist.id, listOf(track.id))
+            prefs.edit().putString(lastPlaylistIdKey, playlist.id).apply()
+            _statusMessage.value = "Created ${playlist.name} and added ${track.title}"
+            withContext(Dispatchers.Main) { onDone?.invoke() }
+        }
+    }
+
+    fun createPlaylistAndAddSelectedSongs(name: String, onDone: (() -> Unit)? = null) {
+        val preservedName = name.trim()
+        val ids = _selectedSongIds.value.toList()
+        if (preservedName.isEmpty() || ids.isEmpty()) return
+        viewModelScope.launch {
+            val playlist = repository.createPlaylist(preservedName, null)
+            val added = repository.batchAddTracksToPlaylist(playlist.id, ids)
+            prefs.edit().putString(lastPlaylistIdKey, playlist.id).apply()
+            clearSongSelection()
+            _statusMessage.value = "Created ${playlist.name}; added $added songs"
+            withContext(Dispatchers.Main) { onDone?.invoke() }
         }
     }
 
@@ -760,7 +960,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             }
                         } else if (file.isFile) {
                             val name = file.name.orEmpty().lowercase()
-                            if (name.endsWith(".txt") || name.endsWith(".csv")) {
+                            if (name.endsWith(".csv")) {
                                 filesToImport.add(file)
                             }
                         }
@@ -769,7 +969,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 traverse(docDir)
 
                 if (filesToImport.isEmpty()) {
-                    _statusMessage.value = "No .txt or .csv playlist files found in selected folder"
+                    _statusMessage.value = "No CSV playlist files found in selected folder"
                     return@launch
                 }
 
@@ -778,18 +978,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     val fileName = doc.name ?: "Playlist"
                     try {
                         context.contentResolver.openInputStream(doc.uri)?.use { stream ->
-                            if (fileName.endsWith(".txt", ignoreCase = true)) {
-                                repository.importTxtPlaylist(fileName, stream, DuplicateAction.REPLACE)
-                            } else {
-                                repository.importCsvPlaylist(fileName, stream, DuplicateAction.REPLACE)
-                            }
+                            repository.importCsvPlaylist(fileName, stream, DuplicateAction.REPLACE)
                             successCount++
                         }
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
                 }
-                _statusMessage.value = "Imported $successCount playlists from folder"
+                _statusMessage.value = "Imported $successCount playlist files from folder"
             } catch (e: Exception) {
                 _statusMessage.value = "Folder import failed: ${e.message}"
             } finally {
@@ -821,11 +1017,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addTrackToPlaylist(playlistId: String, track: TrackEntity) {
+        prefs.edit().putString(lastPlaylistIdKey, playlistId).apply()
         viewModelScope.launch {
-            repository.addTrackToPlaylist(playlistId, track)
+            val added = repository.addTrackToPlaylist(playlistId, track)
             _selectedTrackForAddToPlaylist.value = null
-            _statusMessage.value = "Added to playlist!"
+            _statusMessage.value = if (added) "Added to playlist!" else "Already in playlist"
         }
+    }
+
+    /**
+     * One-tap playlist action, parallel to the Like button.
+     * Uses the most recently selected playlist; returns false when a playlist must be chosen first.
+     */
+    fun quickAddToLastPlaylist(track: TrackEntity): Boolean {
+        val playlistId = prefs.getString(lastPlaylistIdKey, null)
+        if (playlistId.isNullOrBlank() || allPlaylists.value.none { it.id == playlistId }) return false
+
+        viewModelScope.launch {
+            val added = repository.addTrackToPlaylist(playlistId, track)
+            val name = allPlaylists.value.firstOrNull { it.id == playlistId }?.name ?: "playlist"
+            _statusMessage.value = if (added) "Added to $name" else "Already in $name"
+        }
+        return true
     }
 
     fun removeEntryFromPlaylist(entryId: Long) {
@@ -930,9 +1143,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val ids = _selectedSongIds.value.toList()
         if (ids.isEmpty()) return
         viewModelScope.launch {
-            for (id in ids) {
-                repository.setLiked(id, isLiked)
-            }
+            repository.batchSetLiked(ids, isLiked)
             clearSongSelection()
             _statusMessage.value = if (isLiked) "Added ${ids.size} songs to Liked" else "Removed ${ids.size} songs from Liked"
         }
@@ -957,10 +1168,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun batchAddSelectedSongsToPlaylist(playlistId: String) {
         val ids = _selectedSongIds.value.toList()
         if (ids.isEmpty()) return
+        prefs.edit().putString(lastPlaylistIdKey, playlistId).apply()
         viewModelScope.launch {
-            repository.batchAddTracksToPlaylist(playlistId, ids)
+            val added = repository.batchAddTracksToPlaylist(playlistId, ids)
             clearSongSelection()
-            _statusMessage.value = "Added ${ids.size} songs to playlist"
+            _statusMessage.value = if (added == ids.size) {
+                "Added $added songs to playlist"
+            } else {
+                "Added $added songs; skipped ${ids.size - added} already in playlist"
+            }
+        }
+    }
+
+    fun batchMoveSelectedSongsToPlaylist(sourcePlaylistId: String, targetPlaylistId: String) {
+        val ids = _selectedSongIds.value.toList()
+        prefs.edit().putString(lastPlaylistIdKey, targetPlaylistId).apply()
+        if (ids.isEmpty()) return
+        viewModelScope.launch {
+            // First add to target
+            repository.batchAddTracksToPlaylist(targetPlaylistId, ids)
+            // Then remove from source
+            val entries = database.playlistDao().getPlaylistEntriesSnapshot(sourcePlaylistId)
+            val entryIdsToRemove = entries.filter { it.trackId != null && ids.contains(it.trackId) }.map { it.entryId }
+            repository.batchRemoveTracksFromPlaylist(entryIdsToRemove)
+            repository.updatePlaylistCover(sourcePlaylistId)
+            
+            clearSongSelection()
+            _statusMessage.value = "Moved ${ids.size} songs to new playlist"
         }
     }
 
@@ -968,9 +1202,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val ids = _selectedSongIds.value.toList()
         if (ids.isEmpty()) return
         viewModelScope.launch {
-            for (id in ids) {
-                repository.deleteTrackFromLibrary(id)
-            }
+            repository.batchDeleteTracksFromLibrary(ids)
             clearSongSelection()
             _statusMessage.value = "Removed ${ids.size} songs from library"
         }
@@ -993,9 +1225,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                // Group strictly by full path and format (lowercase file path) to avoid skipping tracks with same artist/title but different paths or formats
+                // Group strictly by artist, title, and duration to catch logical duplicates
                 val grouped = tracksToAnalyze.groupBy {
-                    it.filePath.lowercase()
+                    "${it.artist.trim().lowercase()}|${it.title.trim().lowercase()}|${if (it.durationMs > 0) it.durationMs / 1000 else 0}"
                 }
 
                 val duplicateTracksToRemove = mutableListOf<TrackEntity>()
@@ -1022,6 +1254,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         clearSongSelection()
                         _statusMessage.value = "Found and removed $duplicatePairsCount duplicate song entries from library!"
                     }
+                    
+                    // Automatically try to match any playlists that broke because we removed their track duplicate
+                    retryMissingMatchesForAllPlaylists()
                 } else {
                     withContext(Dispatchers.Main) {
                         clearSongSelection()
@@ -1043,9 +1278,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val entries = database.playlistDao().getPlaylistEntriesSnapshot(playlistId)
             val entryIdsToRemove = entries.filter { it.trackId != null && ids.contains(it.trackId) }.map { it.entryId }
-            for (id in entryIdsToRemove) {
-                repository.removeTrackFromPlaylist(id)
-            }
+            repository.batchRemoveTracksFromPlaylist(entryIdsToRemove)
+            repository.updatePlaylistCover(playlistId)
             clearSongSelection()
             _statusMessage.value = "Removed ${entryIdsToRemove.size} songs from playlist"
         }
@@ -1054,21 +1288,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun batchRemoveSelectedEntriesFromPlaylist(playlistId: String, entryIds: List<Long>) {
         if (entryIds.isEmpty()) return
         viewModelScope.launch {
-            for (id in entryIds) {
-                repository.removeTrackFromPlaylist(id)
-            }
+            repository.batchRemoveTracksFromPlaylist(entryIds)
+            repository.updatePlaylistCover(playlistId)
             clearSongSelection()
             _statusMessage.value = "Removed ${entryIds.size} songs from playlist"
         }
     }
 
-    fun exportSelectedSongsAsTxt(trackIds: Set<String>): String {
+    fun exportSelectedSongsAsCsv(trackIds: Set<String>): String {
         val all = allTracks.value.associateBy { it.id }
         val tracksToExport = trackIds.mapNotNull { all[it] }
-        return TxtPlaylistUtils.formatTracksAsTxt(tracksToExport)
+        val csvRows = tracksToExport.map { track ->
+            com.example.util.CsvTrackRow(
+                trackName = track.title,
+                artistNames = track.artist,
+                albumName = track.album,
+                durationMs = track.durationMs
+            )
+        }
+        return com.example.util.CsvUtils.exportToCsv(csvRows)
     }
 
     fun setMultiSelectMode(active: Boolean) {
+        if (active) clearFolderSelection()
         setSongMultiSelectActive(active)
         setPlaylistMultiSelectActive(active)
     }
@@ -1076,55 +1318,70 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun clearSelection() {
         clearSongSelection()
         clearPlaylistSelection()
+        clearFolderSelection()
     }
 
     fun openSettings() {
         _currentScreen.value = Screen.Settings
     }
 
-    fun exportPlaylistTxt(context: Context, playlistId: String) {
+    fun exportPlaylistCsv(context: Context, playlistId: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            val playlist = database.playlistDao().getPlaylistById(playlistId) ?: return@launch
-            val entries = database.playlistDao().getPlaylistEntriesSnapshot(playlistId)
-            val all = allTracks.value.associateBy { it.id }
-            val txtContent = buildString {
-                for (entry in entries) {
+            try {
+                val playlist = database.playlistDao().getPlaylistById(playlistId) ?: return@launch
+                val entries = database.playlistDao().getPlaylistEntriesSnapshot(playlistId)
+                val all = allTracks.value.associateBy { it.id }
+                val csvRows = entries.map { entry ->
                     val track = entry.trackId?.let { all[it] }
-                    val artist = track?.artist ?: entry.csvArtist
-                    val title = track?.title ?: entry.csvTitle
-                    val duration = track?.durationMs ?: entry.csvDurationMs
-                    appendLine("$artist:$title:$duration")
+                    com.example.util.CsvTrackRow(
+                        trackName = track?.title ?: entry.csvTitle,
+                        artistNames = track?.artist ?: entry.csvArtist,
+                        albumName = track?.album ?: entry.csvAlbum,
+                        durationMs = track?.durationMs ?: entry.csvDurationMs,
+                        trackUri = entry.csvTrackUri ?: ""
+                    )
                 }
+                val csvContent = com.example.util.CsvUtils.exportToCsv(csvRows)
+                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/csv"
+                    putExtra(Intent.EXTRA_SUBJECT, "Playlist Export: ${playlist.name}")
+                    putExtra(Intent.EXTRA_TEXT, csvContent)
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+                context.startActivity(Intent.createChooser(sendIntent, "Share Playlist CSV").apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                })
+                _statusMessage.value = "Exported playlist '${playlist.name}' as CSV"
+            } catch (e: Exception) {
+                _statusMessage.value = "Export failed: ${e.message}"
             }
-            val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "text/plain"
-                putExtra(Intent.EXTRA_SUBJECT, "Playlist Export: ${playlist.name}")
-                putExtra(Intent.EXTRA_TEXT, txtContent)
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            context.startActivity(Intent.createChooser(sendIntent, "Share Playlist TXT").apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            })
-            _statusMessage.value = "Exported playlist '${playlist.name}' as TXT"
         }
     }
 
-    fun exportSelectedSongsTxt(context: Context) {
+    fun exportSelectedSongsCsv(context: Context) {
         val ids = _selectedSongIds.value
         if (ids.isEmpty()) return
         val all = allTracks.value.associateBy { it.id }
         val tracks = ids.mapNotNull { all[it] }
-        val txtContent = TxtPlaylistUtils.formatTracksAsTxt(tracks)
+        val csvRows = tracks.map { track ->
+            com.example.util.CsvTrackRow(
+                trackName = track.title,
+                artistNames = track.artist,
+                albumName = track.album,
+                durationMs = track.durationMs
+            )
+        }
+        val csvContent = com.example.util.CsvUtils.exportToCsv(csvRows)
         val sendIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
+            type = "text/csv"
             putExtra(Intent.EXTRA_SUBJECT, "Exported Songs")
-            putExtra(Intent.EXTRA_TEXT, txtContent)
+            putExtra(Intent.EXTRA_TEXT, csvContent)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK
         }
-        context.startActivity(Intent.createChooser(sendIntent, "Share Selected Songs TXT").apply {
+        context.startActivity(Intent.createChooser(sendIntent, "Share Selected Songs CSV").apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK
         })
-        _statusMessage.value = "Exported ${tracks.size} songs as TXT"
+        _statusMessage.value = "Exported ${tracks.size} songs as CSV"
     }
 
     // Playlist Multi-Select Operations
@@ -1168,6 +1425,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // Folder Multi-Select Operations
+    fun startFolderSelection(folderId: String? = null) {
+        clearSongSelection()
+        clearPlaylistSelection()
+        _isFolderMultiSelectActive.value = true
+        if (folderId != null) {
+            _selectedFolderIds.value = setOf(folderId)
+        } else {
+            _selectedFolderIds.value = emptySet()
+        }
+    }
+
+    fun toggleFolderSelection(folderId: String) {
+        val current = _selectedFolderIds.value.toMutableSet()
+        if (!current.add(folderId)) current.remove(folderId)
+        _selectedFolderIds.value = current
+        _isFolderMultiSelectActive.value = current.isNotEmpty()
+    }
+
+    fun selectAllFolders(folderIds: List<String>) {
+        _selectedFolderIds.value = folderIds.toSet()
+        _isFolderMultiSelectActive.value = folderIds.isNotEmpty()
+    }
+
+    fun clearFolderSelection() {
+        _selectedFolderIds.value = emptySet()
+        _isFolderMultiSelectActive.value = false
+    }
+
+    fun setFolderMultiSelectActive(active: Boolean) {
+        _isFolderMultiSelectActive.value = active
+        if (!active) _selectedFolderIds.value = emptySet()
+    }
+
     // Check Local Files
     fun checkLocalFilesExistence() {
         viewModelScope.launch {
@@ -1184,6 +1475,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _statusMessage.value = "Check error: ${e.message}"
             } finally {
                 _isScanning.value = false
+            }
+        }
+    }
+
+    /**
+     * Automatically removes duplicate song entries when a playlist is opened.
+     * The first occurrence (lowest order index) is kept.
+     */
+    fun cleanPlaylistDuplicatesOnOpen(playlistId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val groups = repository.findDuplicatesInPlaylist(playlistId)
+                val entryIdsToRemove = groups
+                    .flatMap { it.items.sortedBy { item -> item.orderIndex }.drop(1) }
+                    .map { it.entryId }
+                    .distinct()
+                if (entryIdsToRemove.isNotEmpty()) {
+                    repository.removeDuplicateEntriesFromPlaylist(playlistId, entryIdsToRemove)
+                    withContext(Dispatchers.Main) {
+                        _statusMessage.value = "Automatically removed ${entryIdsToRemove.size} duplicate songs from playlist"
+                    }
+                }
+            } catch (e: Exception) {
+                // Opening a playlist should never fail just because duplicate cleanup failed.
             }
         }
     }
@@ -1226,44 +1541,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // General Playlist File Import (supports .csv, .txt, etc.)
-    fun importPlaylistFile(fileName: String, inputStream: InputStream) {
-        if (fileName.endsWith(".txt", ignoreCase = true)) {
-            importTxt(fileName, inputStream)
-        } else {
-            importCsv(fileName, inputStream)
-        }
-    }
-
-    // TXT Playlist Import (<artist>:<title>:<milliseconds>)
-    fun importTxt(fileName: String, inputStream: InputStream) {
-        viewModelScope.launch {
-            val sanitized = NormalizationUtils.sanitizePlaylistName(fileName)
-            val existing = repository.getPlaylistByName(sanitized)
-            if (existing != null) {
-                _duplicatePrompt.value = DuplicatePrompt(fileName, inputStream, sanitized)
-            } else {
-                executeTxtImport(fileName, inputStream, DuplicateAction.REPLACE)
+    // CSV adds a normal playlist. ZIP restores a folder-aware backup containing playlists.
+    fun importPlaylistOrFolderFile(fileName: String, inputStream: InputStream) {
+        when (fileName.substringAfterLast('.', "").lowercase()) {
+            "csv" -> importCsv(fileName, inputStream)
+            "zip" -> viewModelScope.launch(Dispatchers.IO) {
+                val temp = File(context.cacheDir, "folder_restore_${System.currentTimeMillis()}.zip")
+                try {
+                    inputStream.use { input -> FileOutputStream(temp).use { output -> input.copyTo(output) } }
+                    _isScanning.value = true
+                    val result = BackupRestoreManager.restoreAllData(context, database, temp)
+                    withContext(Dispatchers.Main) {
+                        result.onSuccess { report ->
+                            _restoreReport.value = report
+                            _statusMessage.value = "Folder ZIP restored: ${report.playlistsRestored} playlists restored"
+                        }.onFailure { err ->
+                            _statusMessage.value = "Folder ZIP restore failed: ${err.message}"
+                        }
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) { _statusMessage.value = "Folder ZIP import failed: ${e.message}" }
+                } finally {
+                    temp.delete()
+                    _isScanning.value = false
+                }
+            }
+            else -> {
+                try { inputStream.close() } catch (_: Exception) {}
+                _statusMessage.value = "Choose a CSV playlist or a folder backup ZIP"
             }
         }
     }
 
-    private suspend fun executeTxtImport(
-        fileName: String,
-        inputStream: InputStream,
-        action: DuplicateAction
-    ) {
-        _isScanning.value = true
-        try {
-            val summary = repository.importTxtPlaylist(fileName, inputStream, action)
-            _lastImportSummary.value = summary
-            _statusMessage.value = "Restored TXT playlist '${summary.playlistName}': ${summary.matchedCount}/${summary.totalTracks} matched"
-        } catch (e: Exception) {
-            e.printStackTrace()
-            _statusMessage.value = "Error importing TXT: ${e.message}"
-        } finally {
-            _isScanning.value = false
+    // New playlist files use CSV only. JSON remains reserved for backup/restore data.
+    fun importPlaylistFile(fileName: String, inputStream: InputStream) {
+        if (!fileName.substringAfterLast('.', "").equals("csv", ignoreCase = true)) {
+            try { inputStream.close() } catch (_: Exception) {}
+            _statusMessage.value = "Only CSV files can be added as new playlists"
+            return
         }
+        importCsv(fileName, inputStream)
     }
 
     // CSV Import
@@ -1284,11 +1601,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _duplicatePrompt.value = null
         if (action == DuplicateAction.CANCEL) return
         viewModelScope.launch {
-            if (prompt.rawFileName.endsWith(".txt", ignoreCase = true)) {
-                executeTxtImport(prompt.rawFileName, prompt.inputStream, action)
-            } else {
-                executeCsvImport(prompt.rawFileName, prompt.inputStream, action)
-            }
+            executeCsvImport(prompt.rawFileName, prompt.inputStream, action)
         }
     }
 
@@ -1310,6 +1623,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+
     // Import sample files bundled in DemoMusicManager
     fun importSampleCsv(csvFile: File) {
         try {
@@ -1325,8 +1639,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _isScanning.value = true
             try {
                 val scanned = MusicScanner.scanDirectory(context, folder)
-                database.trackDao().insertTracks(scanned)
-                _statusMessage.value = "Scanned ${scanned.size} tracks from ${folder.name}"
+                val deduplicated = scanned.distinctBy { it.id }.distinctBy { it.filePath.lowercase() }
+                database.trackDao().insertTracks(deduplicated)
+                _statusMessage.value = "Scanned ${deduplicated.size} tracks from ${folder.name}"
             } catch (e: Exception) {
                 _statusMessage.value = "Scan error: ${e.message}"
             } finally {
@@ -1359,6 +1674,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun scanAndRememberDocumentTree(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _isScanning.value = true
+            _scanProgressCount.value = 0
+            _scanTotalCount.value = 0
+            _scanProgressPercent.value = 0f
+            try {
+                try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Exception) {}
+
+                val uriStr = uri.toString()
+                val current = _persistedFolderUris.value.toMutableList()
+                if (!current.contains(uriStr)) {
+                    current.add(uriStr)
+                    _persistedFolderUris.value = current
+                    prefs.edit().putStringSet("persisted_uris", current.toSet()).apply()
+                }
+
+                val scanned = MusicScanner.scanDocumentTree(context, uri)
+                val deduplicated = scanned.distinctBy { it.filePath.lowercase() }
+                _scanTotalCount.value = deduplicated.size
+                if (deduplicated.isNotEmpty()) {
+                    database.trackDao().insertTracks(deduplicated)
+                    database.playlistDao().getAllPlaylistsSnapshot().forEach { playlist ->
+                        repository.retryMissingMatches(playlist.id)
+                    }
+                }
+                _scanProgressCount.value = deduplicated.size
+                _scanProgressPercent.value = 1f
+                _statusMessage.value = "Imported ${deduplicated.size} songs with embedded covers where available"
+            } catch (e: Exception) {
+                _statusMessage.value = "Scan error: ${e.message}"
+            } finally {
+                _isScanning.value = false
+            }
+        }
+    }
+
     fun scanSingleDocumentTree(uriStr: String) {
         viewModelScope.launch(Dispatchers.IO) {
             _isScanning.value = true
@@ -1367,14 +1723,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val uri = Uri.parse(uriStr)
                 val scanned = MusicScanner.scanDocumentTree(context, uri)
-                if (scanned.isNotEmpty()) {
-                    database.trackDao().insertTracks(scanned)
+                val deduplicated = scanned.distinctBy { it.id }.distinctBy { it.filePath.lowercase() }
+                if (deduplicated.isNotEmpty()) {
+                    database.trackDao().insertTracks(deduplicated)
                     val playlists = database.playlistDao().getAllPlaylistsSnapshot()
                     for (p in playlists) {
                         repository.retryMissingMatches(p.id)
                     }
                 }
-                _statusMessage.value = "Imported ${scanned.size} tracks from folder!"
+                _statusMessage.value = "Imported ${deduplicated.size} tracks from folder!"
             } catch (e: Exception) {
                 _statusMessage.value = "Scan error: ${e.message}"
             } finally {
@@ -1390,14 +1747,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _scanProgressPercent.value = 0f
             try {
                 val scanned = MusicScanner.scanMultipleDirectories(context, listOf(File(path)))
-                if (scanned.isNotEmpty()) {
-                    database.trackDao().insertTracks(scanned)
+                val deduplicated = scanned.distinctBy { it.id }.distinctBy { it.filePath.lowercase() }
+                if (deduplicated.isNotEmpty()) {
+                    database.trackDao().insertTracks(deduplicated)
                     val playlists = database.playlistDao().getAllPlaylistsSnapshot()
                     for (p in playlists) {
                         repository.retryMissingMatches(p.id)
                     }
                 }
-                _statusMessage.value = "Imported ${scanned.size} tracks from folder path!"
+                _statusMessage.value = "Imported ${deduplicated.size} tracks from folder path!"
             } catch (e: Exception) {
                 _statusMessage.value = "Scan error: ${e.message}"
             } finally {
@@ -1411,8 +1769,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _isScanning.value = true
             try {
                 val scanned = MusicScanner.scanMediaStore(context)
-                database.trackDao().insertTracks(scanned)
-                _statusMessage.value = "Found ${scanned.size} device audio tracks"
+                val deduplicated = scanned.distinctBy { it.id }.distinctBy { it.filePath.lowercase() }
+                database.trackDao().insertTracks(deduplicated)
+                _statusMessage.value = "Found ${deduplicated.size} device audio tracks"
             } catch (e: Exception) {
                 _statusMessage.value = "MediaStore scan: ${e.message}"
             } finally {
@@ -1426,8 +1785,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _isScanning.value = true
             try {
                 val demoTracks = DemoMusicManager.generateDemoLibrary(context)
-                database.trackDao().insertTracks(demoTracks)
-                _statusMessage.value = "Loaded ${demoTracks.size} sample songs and playlists"
+                val deduplicated = demoTracks.distinctBy { it.id }.distinctBy { it.filePath.lowercase() }
+                database.trackDao().insertTracks(deduplicated)
+                _statusMessage.value = "Loaded ${deduplicated.size} sample songs and playlists"
             } catch (e: Exception) {
                 _statusMessage.value = "Error loading demo library: ${e.message}"
             } finally {
@@ -1491,6 +1851,102 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } finally {
                 withContext(Dispatchers.Main) {
                     _isScanning.value = false
+                }
+            }
+        }
+    }
+
+    fun backupSelectedFolders(context: Context) {
+        val folderIds = _selectedFolderIds.value.toSet()
+        if (folderIds.isEmpty()) {
+            _statusMessage.value = "No folders selected to backup"
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val backupDir = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "LocalMusicBackups"
+                ).apply { mkdirs() }
+                val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault()).format(java.util.Date())
+                val zipFile = File(backupDir, "Folders_Backup_$timestamp.zip")
+                val folders = database.playlistFolderDao().getAllFoldersSnapshot()
+                    .filter { it.id in folderIds }
+                val playlists = database.playlistDao().getAllPlaylistsSnapshot()
+                    .filter { it.folderId in folderIds }
+                val tracks = database.trackDao().getAllTracksSnapshot().associateBy { it.id }
+                var includedSongCount = 0
+
+                java.util.zip.ZipOutputStream(java.io.FileOutputStream(zipFile)).use { zipOut ->
+                    val folderMeta = org.json.JSONArray()
+                    folders.forEach { folder ->
+                        folderMeta.put(org.json.JSONObject().apply {
+                            put("id", folder.id)
+                            put("name", folder.name)
+                            put("createdAt", folder.createdAt)
+                            put("isPinned", folder.isPinned)
+                        })
+                    }
+                    writeZipTextEntry(zipOut, "backup/folders.json", folderMeta.toString(2))
+
+                    val playlistMeta = org.json.JSONArray()
+                    val uniqueSongKeys = linkedSetOf<String>()
+                    val songRows = mutableListOf<com.example.util.CsvTrackRow>()
+                    playlists.forEach { playlist ->
+                        val folderName = folders.firstOrNull { it.id == playlist.folderId }?.name.orEmpty()
+                        val entries = database.playlistDao().getPlaylistEntriesSnapshot(playlist.id)
+                        val csvRows = entries.map { entry ->
+                            val track = entry.trackId?.let { tracks[it] }
+                            val row = com.example.util.CsvTrackRow(
+                                trackName = track?.title ?: entry.csvTitle,
+                                artistNames = track?.artist ?: entry.csvArtist,
+                                albumName = track?.album ?: entry.csvAlbum,
+                                durationMs = track?.durationMs ?: entry.csvDurationMs,
+                                trackUri = entry.csvTrackUri ?: ""
+                            )
+                            val key = "${row.artistNames.lowercase()}|${row.trackName.lowercase()}|${row.durationMs}"
+                            if (uniqueSongKeys.add(key)) songRows += row
+                            row
+                        }
+                        val relativePath = "folders/${safeZipPart(folderName)}/${safeZipPart(playlist.name)}.csv"
+                        writeZipTextEntry(zipOut, relativePath, com.example.util.CsvUtils.exportToCsv(csvRows))
+                        playlistMeta.put(org.json.JSONObject().apply {
+                            put("id", playlist.id)
+                            put("name", playlist.name)
+                            put("description", playlist.description)
+                            put("coverPath", playlist.coverPath ?: "")
+                            put("createdAt", playlist.createdAt)
+                            put("updatedAt", playlist.updatedAt)
+                            put("isSystemLiked", playlist.isSystemLiked)
+                            put("isPinned", playlist.isPinned)
+                            put("folderName", folderName)
+                            put("path", relativePath)
+                        })
+                    }
+                    writeZipTextEntry(zipOut, "backup/playlists.json", playlistMeta.toString(2))
+                    includedSongCount = songRows.size
+                    writeZipTextEntry(zipOut, "backup/songs.csv", com.example.util.CsvUtils.exportToCsv(songRows))
+                    writeZipTextEntry(
+                        zipOut,
+                        "backup/manifest.json",
+                        org.json.JSONObject().apply {
+                            put("backupVersion", 3)
+                            put("format", "folder-selection-csv")
+                            put("folderCount", folders.size)
+                            put("playlistCount", playlists.size)
+                            put("songCount", includedSongCount)
+                        }.toString(2)
+                    )
+                }
+
+                withContext(Dispatchers.Main) {
+                    _lastBackupPath.value = zipFile.absolutePath
+                    _statusMessage.value = "Backed up ${folders.size} folders, ${playlists.size} playlists and ${includedSongCount} songs to ${zipFile.absolutePath}"
+                    clearFolderSelection()
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _statusMessage.value = "Folder backup failed: ${e.message}"
                 }
             }
         }

@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import android.widget.Toast
+import com.example.util.toTitleCaseDisplay
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -45,6 +46,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -82,7 +84,6 @@ import com.example.ui.theme.SpotifyPrimaryText
 import com.example.ui.theme.SpotifySecondaryText
 import com.example.ui.theme.SpotifyWarning
 import com.example.util.SortUtils
-import com.example.util.toTitleCaseDisplay
 
 @Composable
 fun PlaylistDetailScreen(
@@ -102,6 +103,10 @@ fun PlaylistDetailScreen(
     val duplicateGroups by viewModel.activePlaylistDuplicates.collectAsState()
     val missingFileTrackIds by viewModel.missingFileTrackIds.collectAsState()
     val isShuffle by viewModel.isShuffle.collectAsState()
+
+    LaunchedEffect(playlist.id) {
+        viewModel.cleanPlaylistDuplicatesOnOpen(playlist.id)
+    }
 
     val entriesFlow = remember(playlist.id) { viewModel.repository.getPlaylistEntries(playlist.id) }
     val rawEntries by entriesFlow.collectAsState(initial = emptyList())
@@ -220,19 +225,10 @@ fun PlaylistDetailScreen(
                                 modifier = Modifier.background(SpotifyCardBackground)
                             ) {
                                 DropdownMenuItem(
-                                    text = { Text("Find & Remove Duplicates", color = SpotifyPrimaryText) },
+                                    text = { Text(if (playlist.isPinned) "Unpin Playlist" else "Pin Playlist", color = SpotifyPrimaryText) },
                                     onClick = {
                                         showMenu = false
-                                        viewModel.findDuplicatesInActivePlaylist(playlist.id)
-                                        showDuplicatesDialog = true
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Check Local Files on Device", color = SpotifyPrimaryText) },
-                                    onClick = {
-                                        showMenu = false
-                                        viewModel.checkLocalFilesExistence()
-                                        Toast.makeText(context, "Checked all local audio files", Toast.LENGTH_SHORT).show()
+                                        viewModel.setPlaylistPinned(playlist.id, !playlist.isPinned)
                                     }
                                 )
                                 DropdownMenuItem(
@@ -255,10 +251,10 @@ fun PlaylistDetailScreen(
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Export Playlist (TXT/CSV)", color = SpotifyPrimaryText) },
+                                    text = { Text("Export Playlist as CSV", color = SpotifyPrimaryText) },
                                     onClick = {
                                         showMenu = false
-                                        viewModel.exportPlaylistTxt(context, playlist.id)
+                                        viewModel.exportPlaylistCsv(context, playlist.id)
                                     }
                                 )
                                 DropdownMenuItem(
@@ -451,8 +447,13 @@ fun PlaylistDetailScreen(
                                 viewModel.setMultiSelectMode(true)
                                 viewModel.toggleSongSelection(track.id)
                             },
-                            onTrackClick = { viewModel.playTrack(track, matchedTracks) },
+                        onTrackClick = { viewModel.playTrack(track, matchedTracks) },
                             onLikeToggle = { viewModel.toggleLike(track) },
+                            onQuickAddToPlaylist = {
+                                if (!viewModel.quickAddToLastPlaylist(track)) {
+                                    viewModel.setSelectedTrackForAddToPlaylist(track)
+                                }
+                            },
                             onOptionsClick = { viewModel.setSelectedTrackForOptions(track) }
                         )
                     }
@@ -487,7 +488,7 @@ fun PlaylistDetailScreen(
                     Toast.makeText(context, "Updated liked songs", Toast.LENGTH_SHORT).show()
                 },
                 onExport = {
-                    viewModel.exportSelectedSongsTxt(context)
+                    viewModel.exportSelectedSongsCsv(context)
                 },
                 onRemove = {
                     viewModel.batchRemoveSelectedEntriesFromPlaylist(playlist.id)
@@ -525,11 +526,19 @@ fun PlaylistDetailScreen(
         AddToPlaylistDialog(
             playlists = playlists,
             onSelectPlaylist = { targetPlaylist ->
-                viewModel.batchAddSelectedSongsToPlaylist(targetPlaylist.id)
+                if (isMovingToPlaylist) {
+                    viewModel.batchMoveSelectedSongsToPlaylist(playlist.id, targetPlaylist.id)
+                    Toast.makeText(context, "Moved to ${targetPlaylist.name}", Toast.LENGTH_SHORT).show()
+                } else {
+                    viewModel.batchAddSelectedSongsToPlaylist(targetPlaylist.id)
+                    Toast.makeText(context, "Added to ${targetPlaylist.name}", Toast.LENGTH_SHORT).show()
+                }
                 showAddToPlaylistDialog = false
-                Toast.makeText(context, "Added to ${targetPlaylist.name}", Toast.LENGTH_SHORT).show()
             },
-            onDismiss = { showAddToPlaylistDialog = false }
+            onDismiss = { showAddToPlaylistDialog = false },
+            onCreatePlaylist = if (isMovingToPlaylist) null else { name ->
+                viewModel.createPlaylistAndAddSelectedSongs(name) { showAddToPlaylistDialog = false }
+            }
         )
     }
 

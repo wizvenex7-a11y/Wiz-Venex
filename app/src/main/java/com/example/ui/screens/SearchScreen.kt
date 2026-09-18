@@ -4,6 +4,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -14,6 +16,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Checklist
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -25,13 +28,17 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import com.example.ui.MainViewModel
 import com.example.ui.components.TrackRowItem
+import com.example.ui.components.BatchSongActionBar
+import com.example.ui.components.AddToPlaylistDialog
 import com.example.ui.theme.SpotifyDarkBackground
 import com.example.ui.theme.SpotifyElevated
 import com.example.ui.theme.SpotifyGreen
@@ -47,106 +54,175 @@ fun SearchScreen(
     val filteredTracks by viewModel.filteredTracks.collectAsState()
     val currentPlayingTrack by viewModel.currentTrack.collectAsState()
     val isPlaying by viewModel.isPlaying.collectAsState()
+    val isMultiSelectMode by viewModel.isSongMultiSelectActive.collectAsState()
+    val selectedTrackIds by viewModel.selectedSongIds.collectAsState()
+    val allPlaylists by viewModel.allPlaylists.collectAsState()
+    var showAddToPlaylistDialog by remember { mutableStateOf(false) }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .background(SpotifyDarkBackground)
-            .testTag("search_screen")
-    ) {
-        // Search Header & Field
+    Box(modifier = modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 16.dp)
+                .fillMaxSize()
+                .background(SpotifyDarkBackground)
+                .testTag("search_screen")
         ) {
-            Text(
-                text = "Search",
-                color = SpotifyPrimaryText,
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = { viewModel.setSearchQuery(it) },
-                placeholder = { Text("Search songs, artists, albums...", color = SpotifySecondaryText) },
-                leadingIcon = {
-                    Icon(
-                        imageVector = Icons.Default.Search,
-                        contentDescription = "Search",
-                        tint = SpotifySecondaryText
-                    )
-                },
-                trailingIcon = {
-                    if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { viewModel.setSearchQuery("") }) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Clear",
-                                tint = SpotifySecondaryText
-                            )
-                        }
-                    }
-                },
-                shape = RoundedCornerShape(8.dp),
-                colors = TextFieldDefaults.colors(
-                    focusedTextColor = SpotifyPrimaryText,
-                    unfocusedTextColor = SpotifyPrimaryText,
-                    focusedContainerColor = SpotifyElevated,
-                    unfocusedContainerColor = SpotifyElevated,
-                    focusedIndicatorColor = SpotifyGreen
-                ),
-                singleLine = true,
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .testTag("search_input_field")
-            )
-        }
-
-        // Results
-        if (searchQuery.isNotBlank() && filteredTracks.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(32.dp),
-                contentAlignment = Alignment.Center
+                    .padding(horizontal = 16.dp, vertical = 16.dp)
             ) {
-                Text(
-                    text = "No results found for \"$searchQuery\"",
-                    color = SpotifySecondaryText,
-                    fontSize = 15.sp
-                )
-            }
-        } else {
-            LazyColumn(
-                contentPadding = PaddingValues(bottom = 120.dp),
-                modifier = Modifier.fillMaxSize()
-            ) {
-                if (searchQuery.isBlank()) {
-                    item {
-                        Text(
-                            text = "Browse all local music (${filteredTracks.size})",
-                            color = SpotifySecondaryText,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Search",
+                        color = SpotifyPrimaryText,
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    IconButton(
+                        onClick = {
+                            if (isMultiSelectMode) viewModel.clearSongSelection()
+                            else viewModel.setSongMultiSelectActive(true)
+                        },
+                        modifier = Modifier.testTag("search_multi_select_toggle")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Checklist,
+                            contentDescription = "Multi Select",
+                            tint = if (isMultiSelectMode) SpotifyGreen else SpotifySecondaryText
                         )
                     }
                 }
 
-                items(filteredTracks) { track ->
-                    TrackRowItem(
-                        track = track,
-                        isPlaying = isPlaying && currentPlayingTrack?.id == track.id,
-                        onTrackClick = { viewModel.playTrack(track, filteredTracks) },
-                        onLikeToggle = { viewModel.toggleLike(track) },
-                        onOptionsClick = { viewModel.setSelectedTrackForOptions(track) }
+                Spacer(modifier = Modifier.height(12.dp))
+
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { viewModel.setSearchQuery(it) },
+                    placeholder = { Text("Search songs, artists, albums...", color = SpotifySecondaryText) },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Default.Search,
+                            contentDescription = "Search",
+                            tint = SpotifySecondaryText
+                        )
+                    },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { viewModel.setSearchQuery("") }) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Clear",
+                                    tint = SpotifySecondaryText
+                                )
+                            }
+                        }
+                    },
+                    shape = RoundedCornerShape(8.dp),
+                    colors = TextFieldDefaults.colors(
+                        focusedTextColor = SpotifyPrimaryText,
+                        unfocusedTextColor = SpotifyPrimaryText,
+                        focusedContainerColor = SpotifyElevated,
+                        unfocusedContainerColor = SpotifyElevated,
+                        focusedIndicatorColor = SpotifyGreen
+                    ),
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("search_input_field")
+                )
+            }
+
+            if (searchQuery.isNotBlank() && filteredTracks.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(32.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "No results found for \"$searchQuery\"",
+                        color = SpotifySecondaryText,
+                        fontSize = 15.sp
                     )
                 }
+            } else {
+                LazyColumn(
+                    contentPadding = PaddingValues(bottom = if (isMultiSelectMode) 180.dp else 120.dp),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    if (searchQuery.isBlank()) {
+                        item {
+                            Text(
+                                text = "Browse all local music (${filteredTracks.size})",
+                                color = SpotifySecondaryText,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                            )
+                        }
+                    }
+
+                    items(filteredTracks) { track ->
+                        val isSelected = selectedTrackIds.contains(track.id)
+                        TrackRowItem(
+                            track = track,
+                            isPlaying = isPlaying && currentPlayingTrack?.id == track.id,
+                            isMultiSelectMode = isMultiSelectMode,
+                            isSelected = isSelected,
+                            onSelectToggle = { viewModel.toggleSongSelection(track.id) },
+                            onLongClick = {
+                                viewModel.setSongMultiSelectActive(true)
+                                viewModel.toggleSongSelection(track.id)
+                            },
+                            onTrackClick = { viewModel.playTrack(track, filteredTracks) },
+                            onLikeToggle = { viewModel.toggleLike(track) },
+                            onQuickAddToPlaylist = {
+                                if (!viewModel.quickAddToLastPlaylist(track)) {
+                                    viewModel.setSelectedTrackForAddToPlaylist(track)
+                                }
+                            },
+                            onOptionsClick = { viewModel.setSelectedTrackForOptions(track) }
+                        )
+                    }
+                }
             }
+        }
+
+        if (isMultiSelectMode && selectedTrackIds.isNotEmpty()) {
+            val allIds = filteredTracks.map { it.id }
+            val selectedTracks = filteredTracks.filter { selectedTrackIds.contains(it.id) }
+            BatchSongActionBar(
+                selectedCount = selectedTrackIds.size,
+                totalCount = allIds.size,
+                isInPlaylist = false,
+                onSelectAll = {
+                    if (selectedTrackIds.size == allIds.size) viewModel.clearSongSelection()
+                    else viewModel.selectAllSongs(allIds)
+                },
+                onClearSelection = { viewModel.clearSongSelection() },
+                onAddToQueue = { viewModel.addBatchToQueue(selectedTracks) },
+                onAddToPlaylist = { showAddToPlaylistDialog = true },
+                onToggleLike = { viewModel.batchLikeSelectedSongs(true) },
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+        }
+
+        if (showAddToPlaylistDialog) {
+            AddToPlaylistDialog(
+                playlists = allPlaylists,
+                onSelectPlaylist = { playlist ->
+                    viewModel.batchAddSelectedSongsToPlaylist(playlist.id)
+                    showAddToPlaylistDialog = false
+                },
+                onDismiss = { showAddToPlaylistDialog = false },
+                onCreatePlaylist = { name ->
+                    viewModel.createPlaylistAndAddSelectedSongs(name) { showAddToPlaylistDialog = false }
+                }
+            )
         }
     }
 }

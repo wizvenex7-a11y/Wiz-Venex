@@ -26,12 +26,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Album
+import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.PlaylistPlay
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
@@ -75,6 +76,8 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -161,6 +164,7 @@ fun TrackRowItem(
     onTrackClick: () -> Unit,
     onLikeToggle: () -> Unit,
     onOptionsClick: () -> Unit,
+    onQuickAddToPlaylist: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     isMultiSelectMode: Boolean = false,
     isSelected: Boolean = false,
@@ -218,9 +222,25 @@ fun TrackRowItem(
                 overflow = TextOverflow.Ellipsis
             )
             Spacer(modifier = Modifier.height(2.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
                 Text(
-                    text = "${track.artist.toTitleCaseDisplay} · ${track.album.toTitleCaseDisplay}",
+                    text = track.artist.toTitleCaseDisplay,
+                    color = SpotifySecondaryText,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                Text(
+                    text = " · ",
+                    color = SpotifySecondaryText,
+                    fontSize = 13.sp
+                )
+                Text(
+                    text = track.album.toTitleCaseDisplay,
                     color = SpotifySecondaryText,
                     fontSize = 13.sp,
                     maxLines = 1,
@@ -255,6 +275,20 @@ fun TrackRowItem(
         )
 
         if (!isMultiSelectMode) {
+            if (onQuickAddToPlaylist != null) {
+                IconButton(
+                    onClick = onQuickAddToPlaylist,
+                    modifier = Modifier.testTag("quick_playlist_button_${track.id}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlaylistAdd,
+                        contentDescription = "Add to last playlist",
+                        tint = SpotifySecondaryText,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
             IconButton(
                 onClick = onLikeToggle,
                 modifier = Modifier.testTag("like_button_${track.id}")
@@ -359,6 +393,8 @@ fun PlaylistListItem(
     playlist: PlaylistEntity,
     songCount: Int,
     onClick: () -> Unit,
+    onTogglePin: (() -> Unit)? = null,
+    onMoveToFolder: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     isMultiSelectMode: Boolean = false,
     isSelected: Boolean = false,
@@ -403,6 +439,17 @@ fun PlaylistListItem(
             modifier = Modifier.size(56.dp)
         )
 
+        if (isMultiSelectMode && isSelected) {
+            Icon(
+                imageVector = Icons.Default.CheckCircle,
+                contentDescription = "Selected",
+                tint = SpotifyGreen,
+                modifier = Modifier
+                    .padding(start = 4.dp)
+                    .size(24.dp)
+            )
+        }
+
         Spacer(modifier = Modifier.width(14.dp))
 
         Column(modifier = Modifier.weight(1f)) {
@@ -421,6 +468,35 @@ fun PlaylistListItem(
                 fontSize = 13.sp
             )
         }
+
+        if (!isMultiSelectMode) {
+            if (onMoveToFolder != null) {
+                IconButton(
+                    onClick = onMoveToFolder,
+                    modifier = Modifier.testTag("move_playlist_to_folder_${playlist.id}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.FolderOpen,
+                        contentDescription = "Move to Folder",
+                        tint = SpotifySecondaryText,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+            if (onTogglePin != null) {
+                IconButton(
+                    onClick = onTogglePin,
+                    modifier = Modifier.testTag("pin_playlist_${playlist.id}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PushPin,
+                        contentDescription = if (playlist.isPinned) "Unpin Playlist" else "Pin Playlist",
+                        tint = if (playlist.isPinned) SpotifyGreen else SpotifySecondaryText,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -429,10 +505,15 @@ fun PlaylistListItem(
 fun PlaylistFolderListItem(
     folder: com.example.data.model.PlaylistFolderEntity,
     playlistCount: Int,
+    coverPath: String? = null,
     onClick: () -> Unit,
     onRenameClick: () -> Unit,
     onDeleteClick: () -> Unit,
     onTogglePin: () -> Unit,
+    isMultiSelectMode: Boolean = false,
+    isSelected: Boolean = false,
+    onSelectToggle: (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var showMenu by remember { mutableStateOf(false) }
@@ -440,7 +521,12 @@ fun PlaylistFolderListItem(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .clickable { onClick() }
+            .combinedClickable(
+                onClick = {
+                    if (isMultiSelectMode) onSelectToggle?.invoke() else onClick()
+                },
+                onLongClick = { onLongClick?.invoke() }
+            )
             .padding(horizontal = 16.dp, vertical = 8.dp)
             .testTag("folder_item_${folder.id}"),
         verticalAlignment = Alignment.CenterVertically
@@ -452,12 +538,28 @@ fun PlaylistFolderListItem(
                 .background(Color(0xFF282828)),
             contentAlignment = Alignment.Center
         ) {
-            Icon(
-                imageVector = Icons.Default.Folder,
-                contentDescription = "Folder",
-                tint = SpotifyGreen,
-                modifier = Modifier.size(30.dp)
-            )
+            if (!coverPath.isNullOrBlank() && File(coverPath).exists()) {
+                CoverArtImage(
+                    coverPath = coverPath,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(3.dp)
+                    .size(20.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.78f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Folder,
+                    contentDescription = "Folder",
+                    tint = SpotifyGreen,
+                    modifier = Modifier.size(13.dp)
+                )
+            }
         }
 
         Spacer(modifier = Modifier.width(14.dp))
@@ -479,7 +581,7 @@ fun PlaylistFolderListItem(
             )
         }
 
-        Box {
+        if (!isMultiSelectMode) Box {
             IconButton(
                 onClick = { showMenu = true },
                 modifier = Modifier.testTag("folder_menu_${folder.id}")
@@ -1190,8 +1292,7 @@ fun SongOptionsMenu(
     onRemoveFromPlaylist: (() -> Unit)?,
     onLikeToggle: () -> Unit,
     onPlayNext: () -> Unit,
-    onAddToQueue: () -> Unit,
-    onDeleteFromLibrary: () -> Unit
+    onAddToQueue: () -> Unit
 ) {
     if (track == null) return
 
@@ -1238,7 +1339,6 @@ fun SongOptionsMenu(
             )
             MenuRow(Icons.Default.PlayArrow, "Play next", onPlayNext)
             MenuRow(Icons.Default.QueueMusic, "Add to queue", onAddToQueue)
-            MenuRow(Icons.Default.Delete, "Delete from library", onDeleteFromLibrary, isDestructive = true)
         }
     }
 }
@@ -1401,37 +1501,83 @@ fun RestoreReportDialog(
 fun AddToPlaylistDialog(
     playlists: List<PlaylistEntity>,
     onSelectPlaylist: (PlaylistEntity) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onCreatePlaylist: ((String) -> Unit)? = null
 ) {
+    var creating by remember { mutableStateOf(false) }
+    var newName by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add to Playlist", color = SpotifyPrimaryText) },
+        title = { Text(if (creating) "New Playlist" else "Add to Playlist", color = SpotifyPrimaryText) },
         text = {
-            if (playlists.isEmpty()) {
-                Text("No playlists created yet. Create a playlist from your library first.", color = SpotifySecondaryText)
+            if (creating) {
+                OutlinedTextField(
+                    value = newName,
+                    onValueChange = { newName = it },
+                    label = { Text("Playlist name") },
+                    singleLine = true,
+                    colors = TextFieldDefaults.colors(
+                        focusedTextColor = SpotifyPrimaryText,
+                        unfocusedTextColor = SpotifyPrimaryText,
+                        focusedContainerColor = SpotifyElevated,
+                        unfocusedContainerColor = SpotifyElevated,
+                        focusedIndicatorColor = SpotifyGreen
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
             } else {
-                LazyColumn(modifier = Modifier.height(240.dp)) {
-                    items(playlists) { p ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onSelectPlaylist(p) }
-                                .padding(vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                Column {
+                    if (onCreatePlaylist != null) {
+                        Button(
+                            onClick = { creating = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen)
                         ) {
-                            CoverArtImage(coverPath = p.coverPath, modifier = Modifier.size(40.dp))
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Text(text = p.name, color = SpotifyPrimaryText, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                            Icon(Icons.Default.Add, contentDescription = null, tint = Color.Black)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Create New Playlist", color = Color.Black, fontWeight = FontWeight.Bold)
+                        }
+                        Spacer(Modifier.height(10.dp))
+                    }
+                    if (playlists.isEmpty()) {
+                        Text("No playlists created yet. Create a new playlist here.", color = SpotifySecondaryText)
+                    } else {
+                        LazyColumn(modifier = Modifier.height(240.dp)) {
+                            items(playlists) { p ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { onSelectPlaylist(p) }
+                                        .padding(vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    CoverArtImage(coverPath = p.coverPath, modifier = Modifier.size(40.dp))
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Text(text = p.name.toTitleCaseDisplay, color = SpotifyPrimaryText, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                                }
+                            }
                         }
                     }
                 }
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel", color = SpotifySecondaryText)
+            if (creating) {
+                Button(
+                    onClick = {
+                        val clean = newName.trim()
+                        if (clean.isNotEmpty()) onCreatePlaylist?.invoke(clean)
+                    },
+                    enabled = newName.trim().isNotEmpty(),
+                    colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen)
+                ) { Text("Create", color = Color.Black, fontWeight = FontWeight.Bold) }
+            } else {
+                TextButton(onClick = onDismiss) { Text("Cancel", color = SpotifySecondaryText) }
             }
         },
+        dismissButton = if (creating) {
+            { TextButton(onClick = { creating = false; newName = "" }) { Text("Back", color = SpotifySecondaryText) } }
+        } else null,
         containerColor = SpotifyCardBackground
     )
 }
@@ -1478,9 +1624,8 @@ fun BatchSongActionBar(
     onAddToQueue: () -> Unit,
     onAddToPlaylist: () -> Unit,
     onToggleLike: () -> Unit,
-    onExport: () -> Unit,
-    onRemove: () -> Unit, // Removes from playlist or library
-    onCheckDuplicates: (() -> Unit)? = null, // Custom callback for duplicates
+    onExport: (() -> Unit)? = null,
+    onRemove: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -1544,21 +1689,18 @@ fun BatchSongActionBar(
                         Icon(Icons.Default.Favorite, contentDescription = "Like/Unlike", tint = SpotifyLikedRed, modifier = Modifier.size(22.dp))
                     }
                 }
-                if (onCheckDuplicates != null) {
-                    IconButton(onClick = onCheckDuplicates, modifier = Modifier.testTag("batch_action_duplicates")) {
+                if (onExport != null) {
+                    IconButton(onClick = onExport, modifier = Modifier.testTag("batch_action_export")) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(Icons.Default.ContentCopy, contentDescription = "Check Duplicates", tint = SpotifyGreen, modifier = Modifier.size(22.dp))
+                            Icon(Icons.Default.Share, contentDescription = "Export Selection", tint = SpotifyPrimaryText, modifier = Modifier.size(22.dp))
                         }
                     }
                 }
-                IconButton(onClick = onExport, modifier = Modifier.testTag("batch_action_export")) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(Icons.Default.Share, contentDescription = "Export Selection", tint = SpotifyPrimaryText, modifier = Modifier.size(22.dp))
-                    }
-                }
-                IconButton(onClick = onRemove, modifier = Modifier.testTag("batch_action_delete")) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(Icons.Default.Delete, contentDescription = if (isInPlaylist) "Remove from Playlist" else "Delete", tint = SpotifyError, modifier = Modifier.size(22.dp))
+                if (onRemove != null) {
+                    IconButton(onClick = onRemove, modifier = Modifier.testTag("batch_action_delete")) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.Delete, contentDescription = if (isInPlaylist) "Remove from Playlist" else "Delete", tint = SpotifyError, modifier = Modifier.size(22.dp))
+                        }
                     }
                 }
             }
@@ -1573,9 +1715,10 @@ fun BatchPlaylistActionBar(
     onSelectAll: () -> Unit,
     onClearSelection: () -> Unit,
     onMoveToFolder: () -> Unit,
-    onLikeAllSongs: () -> Unit,
+    onTogglePin: () -> Unit,
     onExportPlaylists: () -> Unit,
     onDeletePlaylists: () -> Unit,
+    isAllPinned: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -1589,7 +1732,7 @@ fun BatchPlaylistActionBar(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp)
+                .padding(8.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1627,7 +1770,7 @@ fun BatchPlaylistActionBar(
                 IconButton(
                     onClick = onMoveToFolder,
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(40.dp)
                         .clip(CircleShape)
                         .background(SpotifyGreen)
                         .testTag("batch_move_playlists_folder")
@@ -1636,30 +1779,30 @@ fun BatchPlaylistActionBar(
                         imageVector = Icons.Default.FolderOpen,
                         contentDescription = "Move to Folder",
                         tint = Color.Black,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
 
                 IconButton(
-                    onClick = onLikeAllSongs,
+                    onClick = onTogglePin,
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(40.dp)
                         .clip(CircleShape)
-                        .background(SpotifyLikedPurple)
-                        .testTag("batch_like_playlists_songs")
+                        .background(SpotifyDarkSecondary)
+                        .testTag("batch_pin_playlists")
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Favorite,
-                        contentDescription = "Add Songs to Liked",
-                        tint = Color.White,
-                        modifier = Modifier.size(24.dp)
+                        imageVector = Icons.Default.PushPin,
+                        contentDescription = if (isAllPinned) "Unpin Playlists" else "Pin Playlists",
+                        tint = if (isAllPinned) SpotifyGreen else SpotifyPrimaryText,
+                        modifier = Modifier.size(20.dp)
                     )
                 }
 
                 IconButton(
                     onClick = onExportPlaylists,
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(40.dp)
                         .clip(CircleShape)
                         .background(SpotifyDarkSecondary)
                         .testTag("batch_export_playlists")
@@ -1668,14 +1811,14 @@ fun BatchPlaylistActionBar(
                         imageVector = Icons.Default.Share,
                         contentDescription = "Export Playlists",
                         tint = SpotifyPrimaryText,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
 
                 IconButton(
                     onClick = onDeletePlaylists,
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(40.dp)
                         .clip(CircleShape)
                         .background(SpotifyError)
                         .testTag("batch_delete_playlists")
@@ -1684,9 +1827,75 @@ fun BatchPlaylistActionBar(
                         imageVector = Icons.Default.Delete,
                         contentDescription = "Delete Playlists",
                         tint = Color.White,
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun BatchFolderActionBar(
+    selectedCount: Int,
+    totalCount: Int,
+    onSelectAll: () -> Unit,
+    onClearSelection: () -> Unit,
+    onBackup: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("batch_folder_action_bar"),
+        color = SpotifyElevated,
+        shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
+        shadowElevation = 8.dp
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onClearSelection) {
+                        Icon(Icons.Default.Close, contentDescription = "Clear Folder Selection", tint = SpotifyPrimaryText)
+                    }
+                    Text(
+                        text = "$selectedCount folders selected",
+                        color = SpotifyPrimaryText,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                TextButton(onClick = onSelectAll) {
+                    Text(
+                        text = if (selectedCount == totalCount) "Deselect All" else "Select All",
+                        color = SpotifyGreen,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+            IconButton(
+                onClick = onBackup,
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .size(42.dp)
+                    .clip(CircleShape)
+                    .background(SpotifyGreen)
+                    .testTag("batch_backup_folders")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Backup,
+                    contentDescription = "Backup Selected Folders",
+                    tint = Color.Black,
+                    modifier = Modifier.size(21.dp)
+                )
             }
         }
     }

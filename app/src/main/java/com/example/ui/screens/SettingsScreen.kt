@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Restore
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -99,7 +100,7 @@ fun SettingsScreen(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri: Uri? ->
         if (uri != null) {
-            viewModel.scanDocumentTree(uri)
+            viewModel.scanAndRememberDocumentTree(uri)
         }
     }
 
@@ -116,6 +117,12 @@ fun SettingsScreen(
             }
             viewModel.restoreFullBackup(cacheZip)
         }
+    }
+
+    val fontPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) viewModel.importAppFont(uri)
     }
 
     LazyColumn(
@@ -135,98 +142,6 @@ fun SettingsScreen(
             Spacer(modifier = Modifier.height(16.dp))
         }
 
-        // Section: Automatic Storage Indexing
-        item {
-            SettingsCategoryHeader("MANUAL STORAGE IMPORT")
-            Card(
-                colors = CardDefaults.cardColors(containerColor = SpotifyElevated),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Text(
-                        text = "Imported Music Library",
-                        color = SpotifyPrimaryText,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Imports music from your local folder directories. No background scanning is active. Click the button below to manually scan and import files.",
-                        color = SpotifySecondaryText,
-                        fontSize = 12.sp
-                    )
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Button(
-                        onClick = { viewModel.scanAllMusicSources() },
-                        enabled = !isScanning,
-                        colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen),
-                        modifier = Modifier.fillMaxWidth().testTag("scan_all_sources_btn")
-                    ) {
-                        if (isScanning) {
-                            CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Scanning Storage...", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        } else {
-                            Icon(Icons.Default.Refresh, contentDescription = null, tint = Color.Black, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Scan Storage Directories", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(SpotifyCardBackground, RoundedCornerShape(8.dp))
-                            .padding(10.dp)
-                    ) {
-                        Column {
-                            Text(
-                                text = if (isScanning) {
-                                    if (scanTotalCount > 0) {
-                                        "Importing... $scanProgressCount / $scanTotalCount songs (${(scanProgressPercent * 100).toInt()}%)"
-                                    } else {
-                                        "Importing... $scanProgressCount songs found so far"
-                                    }
-                                } else {
-                                    "Imported: ${allTracks.size} total songs in library"
-                                },
-                                color = SpotifyGreen,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-
-                            if (isScanning) {
-                                Spacer(modifier = Modifier.height(6.dp))
-                                LinearProgressIndicator(
-                                    progress = { scanProgressPercent },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(6.dp)
-                                        .clip(RoundedCornerShape(3.dp)),
-                                    color = SpotifyGreen,
-                                    trackColor = SpotifyDarkSecondary
-                                )
-                            }
-
-                            if (!statusMessage.isNullOrBlank()) {
-                                Spacer(modifier = Modifier.height(6.dp))
-                                Text(
-                                    text = statusMessage.orEmpty(),
-                                    color = SpotifySecondaryText,
-                                    fontSize = 11.sp
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-            Spacer(modifier = Modifier.height(20.dp))
-        }
-
         // Section: Choose Folders & Scan
         item {
             SettingsCategoryHeader("CHOOSE FOLDERS & MANUAL SCAN")
@@ -242,13 +157,6 @@ fun SettingsScreen(
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Add specific folder paths or select folders to scan for local audio. Scanning is manual—folders are not automatically scanned until you click 'Scan'.",
-                        color = SpotifySecondaryText,
-                        fontSize = 12.sp
-                    )
-
                     Spacer(modifier = Modifier.height(14.dp))
 
                     // 1. Manual Path Input
@@ -278,7 +186,9 @@ fun SettingsScreen(
                         IconButton(
                             onClick = {
                                 if (manualPathText.isNotBlank()) {
-                                    viewModel.addMusicFolderPath(manualPathText)
+                                    val path = manualPathText.trim()
+                                    viewModel.addMusicFolderPath(path)
+                                    viewModel.scanSingleFolderPath(path)
                                     manualPathText = ""
                                 }
                             },
@@ -286,7 +196,7 @@ fun SettingsScreen(
                                 .size(48.dp)
                                 .background(SpotifyGreen, RoundedCornerShape(8.dp))
                         ) {
-                            Icon(imageVector = Icons.Default.Add, contentDescription = "Add Path", tint = Color.Black)
+                            Icon(imageVector = Icons.Default.FolderOpen, contentDescription = "Scan Path", tint = Color.Black)
                         }
                     }
 
@@ -300,7 +210,7 @@ fun SettingsScreen(
                     ) {
                         Icon(imageVector = Icons.Default.FolderOpen, contentDescription = null, tint = SpotifyGreen)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Select Custom Folder via Picker", fontWeight = FontWeight.SemiBold)
+                        Text("Choose Folder & Scan with Covers", fontWeight = FontWeight.SemiBold)
                     }
 
                     Spacer(modifier = Modifier.height(16.dp))
@@ -400,240 +310,82 @@ fun SettingsScreen(
                             modifier = Modifier.padding(vertical = 4.dp)
                         )
                     }
-                }
-            }
-            Spacer(modifier = Modifier.height(20.dp))
-        }
-
-        // Section: Spotify-style Local File Preferences
-        item {
-            SettingsCategoryHeader("SPOTIFY LOCAL MUSIC PREFERENCES")
-            Card(
-                colors = CardDefaults.cardColors(containerColor = SpotifyElevated),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Hide unplayable songs",
-                                color = SpotifyPrimaryText,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "Hide playlist songs not found in your local music sources (like Spotify)",
-                                color = SpotifySecondaryText,
-                                fontSize = 12.sp
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Switch(
-                            checked = hideUnplayable,
-                            onCheckedChange = { viewModel.setHideUnplayableSongs(it) },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Color.White,
-                                checkedTrackColor = SpotifyGreen,
-                                uncheckedThumbColor = SpotifySecondaryText,
-                                uncheckedTrackColor = SpotifyCardBackground
-                            )
-                        )
-                    }
-                }
-            }
-            Spacer(modifier = Modifier.height(20.dp))
-        }
-
-        // Section: Backup & Restore
-        item {
-            SettingsCategoryHeader("BACKUP & RESTORE")
-            Card(
-                colors = CardDefaults.cardColors(containerColor = SpotifyElevated),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Checkbox(
-                            checked = includeAudioInBackup,
-                            onCheckedChange = { includeAudioInBackup = it },
-                            colors = CheckboxDefaults.colors(checkedColor = SpotifyGreen)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Column {
-                            Text(
-                                text = "Include physical music files",
-                                color = SpotifyPrimaryText,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Medium
-                            )
-                            Text(
-                                text = "OFF by default (keeps backup compact & fast)",
-                                color = SpotifySecondaryText,
-                                fontSize = 12.sp
-                            )
-                        }
-                    }
 
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    Button(
-                        onClick = { viewModel.createFullBackup(includeAudioInBackup) },
-                        colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen),
-                        modifier = Modifier.fillMaxWidth().testTag("create_backup_button")
+                    // Scan Progress Indicator inside folders list card
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SpotifyCardBackground, RoundedCornerShape(8.dp))
+                            .padding(10.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Backup,
-                            contentDescription = "Backup",
-                            tint = Color.Black,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Backup All Data (ZIP)",
-                            color = Color.Black,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
-                        )
-                    }
+                        Column {
+                            Text(
+                                text = if (isScanning) {
+                                    if (scanTotalCount > 0) {
+                                        "Importing... $scanProgressCount / $scanTotalCount songs (${(scanProgressPercent * 100).toInt()}%)"
+                                    } else {
+                                        "Importing... $scanProgressCount songs found so far"
+                                    }
+                                } else {
+                                    "Imported: ${allTracks.size} total songs in library"
+                                },
+                                color = SpotifyGreen,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
 
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    OutlinedButton(
-                        onClick = {
-                            restorePickerLauncher.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
-                        },
-                        modifier = Modifier.fillMaxWidth().testTag("restore_backup_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Restore,
-                            contentDescription = "Restore",
-                            tint = SpotifyPrimaryText,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Restore All Data (from ZIP)",
-                            color = SpotifyPrimaryText,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
-                        )
-                    }
-
-                    // Display saved path if available
-                    if (!lastBackupPath.isNullOrBlank()) {
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(SpotifyCardBackground, RoundedCornerShape(8.dp))
-                                .padding(10.dp)
-                        ) {
-                            Column {
-                                Text(
-                                    text = "Backup Saved File Path:",
+                            if (isScanning) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                LinearProgressIndicator(
+                                    progress = { scanProgressPercent },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(6.dp)
+                                        .clip(RoundedCornerShape(3.dp)),
                                     color = SpotifyGreen,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
+                                    trackColor = SpotifyDarkSecondary
                                 )
-                                Spacer(modifier = Modifier.height(2.dp))
+                            }
+
+                            if (!statusMessage.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(6.dp))
                                 Text(
-                                    text = lastBackupPath.orEmpty(),
-                                    color = SpotifyPrimaryText,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Medium
+                                    text = statusMessage.orEmpty(),
+                                    color = SpotifySecondaryText,
+                                    fontSize = 11.sp
                                 )
                             }
                         }
                     }
-
-                    // Existing local backups list if any
-                    val backupsDir = File(context.filesDir, "backups")
-                    val publicDir = File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), "LocalMusicBackups")
-                    val internalFiles = backupsDir.listFiles()?.filter { it.extension.lowercase() == "zip" } ?: emptyList()
-                    val publicFiles = if (publicDir.exists()) publicDir.listFiles()?.filter { it.extension.lowercase() == "zip" } ?: emptyList() else emptyList()
-                    val existingBackups = (internalFiles + publicFiles).distinctBy { it.name }
-
-                    if (existingBackups.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(14.dp))
-                        Text(
-                            text = "Saved Backups Folder Location:",
-                            color = SpotifySecondaryText,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            text = if (publicDir.exists()) publicDir.absolutePath else backupsDir.absolutePath,
-                            color = SpotifyGreen,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        for (backup in existingBackups.sortedByDescending { it.lastModified() }) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(SpotifyCardBackground, RoundedCornerShape(6.dp))
-                                    .clickable { viewModel.restoreFullBackup(backup) }
-                                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = backup.name,
-                                        color = SpotifyPrimaryText,
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                    Text(
-                                        text = "${backup.absolutePath} (${backup.length() / 1024} KB)",
-                                        color = SpotifySecondaryText,
-                                        fontSize = 10.sp
-                                    )
-                                }
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Restore", color = SpotifyGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+            item {
+                SettingsCategoryHeader("APP FONT")
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = SpotifyElevated),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Text("Use System Font or import a .TTF/.OTF font for the app.", color = SpotifySecondaryText, fontSize = 12.sp)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { viewModel.useSystemFont() }, modifier = Modifier.weight(1f)) {
+                                Icon(Icons.Default.TextFields, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("System")
                             }
-                            Spacer(modifier = Modifier.height(4.dp))
+                            Button(onClick = { fontPickerLauncher.launch(arrayOf("font/ttf", "font/otf", "application/octet-stream")) }, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColors(containerColor = SpotifyGreen)) {
+                                Icon(Icons.Default.TextFields, contentDescription = null, tint = Color.Black)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Import Font", color = Color.Black)
+                            }
                         }
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(20.dp))
-        }
 
-        // Section: About & Privacy
-        item {
-            SettingsCategoryHeader("ABOUT")
-            Card(
-                colors = CardDefaults.cardColors(containerColor = SpotifyElevated),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Text(
-                        text = "Local Music Player",
-                        color = SpotifyPrimaryText,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "100% Offline · Local Folder Sources Only · Accurate Title/Artist/Duration Matching · Hide Unplayable Songs · Spotify CSV & ZIP Backup/Restore",
-                        color = SpotifySecondaryText,
-                        fontSize = 12.sp
-                    )
-                }
-            }
             Spacer(modifier = Modifier.height(100.dp))
         }
     }

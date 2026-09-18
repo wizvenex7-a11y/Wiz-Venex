@@ -94,8 +94,20 @@ class MusicRepository(private val context: Context, private val database: AppDat
         database.trackDao().setLiked(trackId, isLiked)
     }
 
+    suspend fun batchSetLiked(trackIds: List<String>, isLiked: Boolean) = withContext(Dispatchers.IO) {
+        trackIds.chunked(900).forEach { chunk ->
+            database.trackDao().batchSetLiked(chunk, isLiked)
+        }
+    }
+
     suspend fun deleteTrackFromLibrary(trackId: String) = withContext(Dispatchers.IO) {
         database.trackDao().deleteTrackById(trackId)
+    }
+
+    suspend fun batchDeleteTracksFromLibrary(trackIds: List<String>) = withContext(Dispatchers.IO) {
+        trackIds.chunked(900).forEach { chunk ->
+            database.trackDao().deleteTracksByIds(chunk)
+        }
     }
 
     suspend fun createPlaylist(name: String, folderId: String? = null, description: String = ""): PlaylistEntity = withContext(Dispatchers.IO) {
@@ -119,13 +131,35 @@ class MusicRepository(private val context: Context, private val database: AppDat
         database.playlistDao().deletePlaylistEntryById(entryId)
     }
 
-    suspend fun addTrackToPlaylist(playlistId: String, track: TrackEntity) = withContext(Dispatchers.IO) {
+    suspend fun batchRemoveTracksFromPlaylist(entryIds: List<Long>) = withContext(Dispatchers.IO) {
+        entryIds.chunked(900).forEach { chunk ->
+            database.playlistDao().batchDeletePlaylistEntries(chunk)
+        }
+    }
+
+    suspend fun addTrackToPlaylist(playlistId: String, track: TrackEntity): Boolean = withContext(Dispatchers.IO) {
         val existingEntries = database.playlistDao().getPlaylistEntriesSnapshot(playlistId)
-        val newOrder = existingEntries.size
+        val existingTracks = database.trackDao().getAllTracksSnapshot().associateBy { it.id }
+        val normKey = { artist: String, title: String, durationMs: Long ->
+            "${NormalizationUtils.pythonNormalize(artist)}|${NormalizationUtils.pythonNormalize(title)}|${durationMs / 2000L}"
+        }
+        val targetKey = normKey(track.artist, track.title, track.durationMs)
+        if (existingEntries.any { entry ->
+                if (entry.trackId == track.id) true
+                else {
+                    val existingTrack = entry.trackId?.let { existingTracks[it] }
+                    normKey(
+                        existingTrack?.artist ?: entry.csvArtist,
+                        existingTrack?.title ?: entry.csvTitle,
+                        existingTrack?.durationMs ?: entry.csvDurationMs
+                    ) == targetKey
+                }
+            }) return@withContext false
+
         val entry = PlaylistTrackEntity(
             playlistId = playlistId,
             trackId = track.id,
-            orderIndex = newOrder,
+            orderIndex = existingEntries.size,
             isMissing = false,
             csvTitle = track.title,
             csvArtist = track.artist,
@@ -134,9 +168,11 @@ class MusicRepository(private val context: Context, private val database: AppDat
             resolvedFilePath = track.filePath
         )
         database.playlistDao().insertPlaylistEntries(listOf(entry))
-
-        // Regenerate cover
+        database.playlistDao().getPlaylistById(playlistId)?.let {
+            database.playlistDao().updatePlaylist(it.copy(updatedAt = System.currentTimeMillis()))
+        }
         updatePlaylistCover(playlistId)
+        true
     }
 
     suspend fun ignoreMissingTracks(playlistId: String) = withContext(Dispatchers.IO) {
@@ -271,9 +307,11 @@ class MusicRepository(private val context: Context, private val database: AppDat
             }
         }
 
-        database.playlistDao().insertPlaylistEntries(newEntries)
+        newEntries.chunked(900).forEach { chunk ->
+            database.playlistDao().insertPlaylistEntries(chunk)
+        }
 
-        // Generate 2x2 cover from distinct albums
+        // Generate a 2x2 cover from the first four songs
         val coverPath = PlaylistCoverGenerator.generateCoverForPlaylist(
             context = context,
             playlistId = playlistId,
@@ -301,148 +339,8 @@ class MusicRepository(private val context: Context, private val database: AppDat
         )
     }
 
-    /**
-     * Imports a TXT stream formatted with lines of <artist>:<title>:<milliseconds>
-     * Keeps the exact order of TXT lines.
-     */
-    suspend fun importTxtPlaylist(
-        rawFileName: String,
-        inputStream: InputStream,
-        duplicateAction: DuplicateAction = DuplicateAction.REPLACE
-    ): ImportSummary = withContext(Dispatchers.IO) {
-        val cleanPlaylistName = NormalizationUtils.sanitizePlaylistName(rawFileName)
-        val txtRows = com.example.util.TxtPlaylistUtils.parseTxtPlaylist(inputStream)
-        val localTracks = database.trackDao().getAllTracksSnapshot()
-        val matcher = FastTrackMatcher(localTracks)
 
-        val existingPlaylist = database.playlistDao().getPlaylistByName(cleanPlaylistName)
 
-        val playlistId = if (existingPlaylist != null) {
-            when (duplicateAction) {
-                DuplicateAction.CANCEL -> return@withContext ImportSummary(
-                    existingPlaylist.id,
-                    cleanPlaylistName,
-                    0, 0, 0, 0
-                )
-                DuplicateAction.REPLACE -> {
-                    database.playlistDao().deletePlaylistEntries(existingPlaylist.id)
-                    existingPlaylist.id
-                }
-                DuplicateAction.MERGE -> existingPlaylist.id
-            }
-        } else {
-            val newId = UUID.randomUUID().toString()
-            val newPlaylist = PlaylistEntity(
-                id = newId,
-                name = cleanPlaylistName,
-                description = "Imported from $rawFileName",
-                createdAt = System.currentTimeMillis(),
-                updatedAt = System.currentTimeMillis()
-            )
-            database.playlistDao().insertPlaylist(newPlaylist)
-            newId
-        }
-
-        var matchedCount = 0
-        var missingCount = 0
-
-        val currentMaxOrder = if (duplicateAction == DuplicateAction.MERGE && existingPlaylist != null) {
-            database.playlistDao().getPlaylistEntriesSnapshot(existingPlaylist.id).size
-        } else 0
-
-        val newEntries = mutableListOf<PlaylistTrackEntity>()
-        val matchedTracksForCover = mutableListOf<TrackEntity>()
-
-        for ((idx, txtRow) in txtRows.withIndex()) {
-            val match = matcher.matchTxtTrack(txtRow, toleranceMs = 3000L)
-            val orderIndex = currentMaxOrder + idx
-
-            when (match) {
-                is MatchResult.SingleMatch -> {
-                    newEntries.add(
-                        PlaylistTrackEntity(
-                            playlistId = playlistId,
-                            trackId = match.track.id,
-                            orderIndex = orderIndex,
-                            isMissing = false,
-                            csvTitle = txtRow.title,
-                            csvArtist = txtRow.artist,
-                            csvAlbum = match.track.album,
-                            csvDurationMs = txtRow.durationMs,
-                            csvTrackUri = null,
-                            resolvedFilePath = match.track.filePath
-                        )
-                    )
-                    matchedTracksForCover.add(match.track)
-                    matchedCount++
-                }
-                is MatchResult.AmbiguousMatch -> {
-                    val best = match.candidates.first()
-                    newEntries.add(
-                        PlaylistTrackEntity(
-                            playlistId = playlistId,
-                            trackId = best.id,
-                            orderIndex = orderIndex,
-                            isMissing = false,
-                            csvTitle = txtRow.title,
-                            csvArtist = txtRow.artist,
-                            csvAlbum = best.album,
-                            csvDurationMs = txtRow.durationMs,
-                            csvTrackUri = null,
-                            resolvedFilePath = best.filePath
-                        )
-                    )
-                    matchedTracksForCover.add(best)
-                    matchedCount++
-                }
-                MatchResult.NoMatch -> {
-                    newEntries.add(
-                        PlaylistTrackEntity(
-                            playlistId = playlistId,
-                            trackId = null,
-                            orderIndex = orderIndex,
-                            isMissing = true,
-                            csvTitle = txtRow.title,
-                            csvArtist = txtRow.artist,
-                            csvAlbum = "",
-                            csvDurationMs = txtRow.durationMs,
-                            csvTrackUri = null,
-                            resolvedFilePath = null
-                        )
-                    )
-                    missingCount++
-                }
-            }
-        }
-
-        database.playlistDao().insertPlaylistEntries(newEntries)
-
-        val coverPath = PlaylistCoverGenerator.generateCoverForPlaylist(
-            context = context,
-            playlistId = playlistId,
-            tracks = matchedTracksForCover,
-            forceRegenerate = true
-        )
-
-        val targetPlaylist = database.playlistDao().getPlaylistById(playlistId)
-        if (targetPlaylist != null && coverPath != null) {
-            database.playlistDao().updatePlaylist(
-                targetPlaylist.copy(
-                    coverPath = coverPath,
-                    updatedAt = System.currentTimeMillis()
-                )
-            )
-        }
-
-        ImportSummary(
-            playlistId = playlistId,
-            playlistName = cleanPlaylistName,
-            totalTracks = txtRows.size,
-            matchedCount = matchedCount,
-            missingCount = missingCount,
-            ambiguousCount = 0
-        )
-    }
 
     /**
      * Detects duplicate songs in a playlist using Artist + Title + Duration (ms)
@@ -517,17 +415,47 @@ class MusicRepository(private val context: Context, private val database: AppDat
     /**
      * Batch adds tracks to a playlist
      */
-    suspend fun batchAddTracksToPlaylist(playlistId: String, trackIds: List<String>) = withContext(Dispatchers.IO) {
-        val existingEntries = database.playlistDao().getPlaylistEntriesSnapshot(playlistId)
-        val startOrder = existingEntries.size
-        val allTracks = database.trackDao().getAllTracksSnapshot().associateBy { it.id }
+    suspend fun batchAddTracksToPlaylist(playlistId: String, trackIds: List<String>): Int = withContext(Dispatchers.IO) {
+        val requestedIds = trackIds.distinct()
+        if (requestedIds.isEmpty()) return@withContext 0
 
-        val newEntries = trackIds.mapIndexedNotNull { index, id ->
-            val track = allTracks[id] ?: return@mapIndexedNotNull null
-            PlaylistTrackEntity(
+        val existingEntries = database.playlistDao().getPlaylistEntriesSnapshot(playlistId)
+        val existingIds = existingEntries.mapNotNull { it.trackId }.toMutableSet()
+        var nextOrder = existingEntries.maxOfOrNull { it.orderIndex }?.plus(1) ?: 0
+
+        val allTracksMap = mutableMapOf<String, TrackEntity>()
+        requestedIds.chunked(900).forEach { chunk ->
+            database.trackDao().getTracksByIds(chunk).forEach { allTracksMap[it.id] = it }
+        }
+
+        // Prevent duplicate songs even when the same audio exists under different track IDs.
+        // Match by normalized artist + title + a small duration bucket, consistent with playlist duplicate review.
+        fun duplicateKey(artist: String, title: String, durationMs: Long): String {
+            val normArtist = NormalizationUtils.pythonNormalize(artist)
+            val normTitle = NormalizationUtils.pythonNormalize(title)
+            val durationBucket = durationMs / 2000L
+            return "$normArtist|$normTitle|$durationBucket"
+        }
+
+        val existingKeys = existingEntries.mapTo(mutableSetOf()) { entry ->
+            val track = entry.trackId?.let { allTracksMap[it] }
+            duplicateKey(
+                artist = track?.artist ?: entry.csvArtist,
+                title = track?.title ?: entry.csvTitle,
+                durationMs = track?.durationMs ?: entry.csvDurationMs
+            )
+        }
+
+        val newEntries = mutableListOf<PlaylistTrackEntity>()
+        for (id in requestedIds) {
+            val track = allTracksMap[id] ?: continue
+            val key = duplicateKey(track.artist, track.title, track.durationMs)
+            if (id in existingIds || !existingKeys.add(key)) continue
+            existingIds.add(id)
+            newEntries += PlaylistTrackEntity(
                 playlistId = playlistId,
                 trackId = track.id,
-                orderIndex = startOrder + index,
+                orderIndex = nextOrder++,
                 isMissing = false,
                 csvTitle = track.title,
                 csvArtist = track.artist,
@@ -537,8 +465,17 @@ class MusicRepository(private val context: Context, private val database: AppDat
             )
         }
 
-        database.playlistDao().insertPlaylistEntries(newEntries)
-        updatePlaylistCover(playlistId)
+        newEntries.chunked(900).forEach { chunk ->
+            database.playlistDao().insertPlaylistEntries(chunk)
+        }
+
+        if (newEntries.isNotEmpty()) {
+            database.playlistDao().getPlaylistById(playlistId)?.let {
+                database.playlistDao().updatePlaylist(it.copy(updatedAt = System.currentTimeMillis()))
+            }
+            updatePlaylistCover(playlistId)
+        }
+        newEntries.size
     }
 
     suspend fun retryMissingMatches(playlistId: String): Int = withContext(Dispatchers.IO) {
@@ -576,7 +513,7 @@ class MusicRepository(private val context: Context, private val database: AppDat
         recovered
     }
 
-    private suspend fun updatePlaylistCover(playlistId: String) {
+    suspend fun updatePlaylistCover(playlistId: String) {
         val playlist = database.playlistDao().getPlaylistById(playlistId) ?: return
         val entries = database.playlistDao().getPlaylistEntriesSnapshot(playlistId)
         val trackIds = entries.mapNotNull { it.trackId }

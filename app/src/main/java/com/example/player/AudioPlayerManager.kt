@@ -27,9 +27,14 @@ class AudioPlayerManager private constructor(private val context: Context) {
 
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private val database = AppDatabase.getInstance(context)
+    private val prefs = context.getSharedPreferences("player_prefs", Context.MODE_PRIVATE)
+
+    private val savedTrackIdKey = "resume_track_id"
+    private val savedPositionKey = "resume_position_ms"
 
     private var mediaPlayer: MediaPlayer? = null
     private var progressJob: Job? = null
+    private var mediaPlayerPrepared = false
 
     private val _currentTrack = MutableStateFlow<TrackEntity?>(null)
     val currentTrack: StateFlow<TrackEntity?> = _currentTrack.asStateFlow()
@@ -49,6 +54,7 @@ class AudioPlayerManager private constructor(private val context: Context) {
     private val _repeatMode = MutableStateFlow(RepeatMode.OFF)
     val repeatMode: StateFlow<RepeatMode> = _repeatMode.asStateFlow()
 
+
     private val _queue = MutableStateFlow<List<TrackEntity>>(emptyList())
     val queue: StateFlow<List<TrackEntity>> = _queue.asStateFlow()
 
@@ -59,6 +65,7 @@ class AudioPlayerManager private constructor(private val context: Context) {
 
     init {
         initMediaPlayer()
+        restoreLastSessionTrack()
     }
 
     private fun initMediaPlayer() {
@@ -98,12 +105,14 @@ class AudioPlayerManager private constructor(private val context: Context) {
         val index = activeList.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
         _queueIndex.value = index
 
-        loadAndPlay(track)
+        loadAndPlay(track, resumeSaved = true)
     }
 
-    private fun loadAndPlay(track: TrackEntity) {
+    private fun loadAndPlay(track: TrackEntity, resumeSaved: Boolean = true) {
         try {
+            persistCurrentPosition()
             mediaPlayer?.reset() ?: initMediaPlayer()
+            mediaPlayerPrepared = false
             val mp = mediaPlayer ?: return
 
             if (track.filePath.startsWith("content://")) {
@@ -118,11 +127,16 @@ class AudioPlayerManager private constructor(private val context: Context) {
             }
 
             mp.prepare()
-            mp.start()
-            _isPlaying.value = true
+            mediaPlayerPrepared = true
             _currentTrack.value = track
             _durationMs.value = if (mp.duration > 0) mp.duration.toLong() else track.durationMs
-            _currentPositionMs.value = 0L
+            val savedPosition = if (resumeSaved) getSavedPositionFor(track) else 0L
+            _currentPositionMs.value = savedPosition.coerceIn(0L, (_durationMs.value - 500L).coerceAtLeast(0L))
+            if (_currentPositionMs.value > 0L) {
+                try { mp.seekTo(_currentPositionMs.value.toInt()) } catch (_: Exception) {}
+            }
+            mp.start()
+            _isPlaying.value = true
 
             try {
                 MediaPlaybackService.start(context)
@@ -142,20 +156,43 @@ class AudioPlayerManager private constructor(private val context: Context) {
         }
     }
 
+    fun pausePlayback() {
+        mediaPlayer?.let { mp ->
+            if (mp.isPlaying) mp.pause()
+        }
+        _currentPositionMs.value = mediaPlayer?.currentPosition?.toLong() ?: _currentPositionMs.value
+        persistCurrentPosition()
+        // Always publish the paused state, even when MediaPlayer is already stopped/null.
+        _isPlaying.value = false
+        stopProgressTracker()
+    }
+
     fun togglePlayPause() {
-        val mp = mediaPlayer ?: return
-        if (mp.isPlaying) {
-            mp.pause()
-            _isPlaying.value = false
-            stopProgressTracker()
-        } else {
-            if (_currentTrack.value == null && _queue.value.isNotEmpty()) {
-                playTrack(_queue.value.first())
-            } else {
-                mp.start()
-                _isPlaying.value = true
-                startProgressTracker()
+        val mp = mediaPlayer
+        if (mp == null) {
+            _currentTrack.value?.let { track ->
+                loadAndPlay(track)
+            } ?: _queue.value.firstOrNull()?.let { track ->
+                playTrack(track, _queue.value)
             }
+            return
+        }
+        if (mp.isPlaying) {
+            pausePlayback()
+        } else if (!mediaPlayerPrepared) {
+            _currentTrack.value?.let { track -> loadAndPlay(track, resumeSaved = true) }
+                ?: _queue.value.firstOrNull()?.let { track -> playTrack(track, _queue.value) }
+        } else {
+            _currentTrack.value?.let { track ->
+                val saved = getSavedPositionFor(track)
+                if (saved > 0L && mp.duration > saved.toInt() + 500) {
+                    try { mp.seekTo(saved.toInt()) } catch (_: Exception) {}
+                    _currentPositionMs.value = saved
+                }
+            }
+            mp.start()
+            _isPlaying.value = true
+            startProgressTracker()
         }
     }
 
@@ -315,9 +352,10 @@ class AudioPlayerManager private constructor(private val context: Context) {
                 mediaPlayer?.let { mp ->
                     if (_isPlaying.value && mp.isPlaying) {
                         _currentPositionMs.value = mp.currentPosition.toLong()
+                        persistCurrentPosition()
                     }
                 }
-                delay(300)
+                delay(1000)
             }
         }
     }
@@ -327,10 +365,43 @@ class AudioPlayerManager private constructor(private val context: Context) {
         progressJob = null
     }
 
+
+    private fun persistCurrentPosition() {
+        val track = _currentTrack.value ?: return
+        val position = try { mediaPlayer?.currentPosition?.toLong() ?: _currentPositionMs.value } catch (_: Exception) { _currentPositionMs.value }
+        prefs.edit()
+            .putString(savedTrackIdKey, track.id)
+            .putLong(savedPositionKey, position.coerceAtLeast(0L))
+            .apply()
+    }
+
+    private fun getSavedPositionFor(track: TrackEntity): Long {
+        if (prefs.getString(savedTrackIdKey, null) != track.id) return 0L
+        return prefs.getLong(savedPositionKey, 0L).coerceAtLeast(0L)
+    }
+
+    private fun restoreLastSessionTrack() {
+        val trackId = prefs.getString(savedTrackIdKey, null) ?: return
+        scope.launch(Dispatchers.IO) {
+            val track = database.trackDao().getTrackById(trackId)
+            if (track != null) {
+                _currentTrack.value = track
+                _queue.value = listOf(track)
+                originalQueue = listOf(track)
+                _queueIndex.value = 0
+                _durationMs.value = track.durationMs
+                _currentPositionMs.value = getSavedPositionFor(track)
+            }
+        }
+    }
+
     fun release() {
+        persistCurrentPosition()
         stopProgressTracker()
+        _isPlaying.value = false
         mediaPlayer?.release()
         mediaPlayer = null
+        mediaPlayerPrepared = false
     }
 
     companion object {

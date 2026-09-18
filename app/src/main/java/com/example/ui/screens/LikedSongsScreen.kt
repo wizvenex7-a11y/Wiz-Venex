@@ -63,6 +63,7 @@ fun LikedSongsScreen(
     val likedTracks by viewModel.likedTracks.collectAsState()
     val currentPlayingTrack by viewModel.currentTrack.collectAsState()
     val isPlaying by viewModel.isPlaying.collectAsState()
+    val isShuffle by viewModel.isShuffle.collectAsState()
     val isMultiSelectMode by viewModel.isSongMultiSelectActive.collectAsState()
     val selectedTrackIds by viewModel.selectedSongIds.collectAsState()
     val allPlaylists by viewModel.allPlaylists.collectAsState()
@@ -180,7 +181,7 @@ fun LikedSongsScreen(
                             Icon(
                                 imageVector = Icons.Default.Shuffle,
                                 contentDescription = "Shuffle",
-                                tint = SpotifySecondaryText,
+                                tint = if (isShuffle) SpotifyGreen else SpotifySecondaryText,
                                 modifier = Modifier.size(28.dp)
                             )
                         }
@@ -246,6 +247,11 @@ fun LikedSongsScreen(
                         },
                         onTrackClick = { viewModel.playTrack(track, likedTracks) },
                         onLikeToggle = { viewModel.toggleLike(track) },
+                        onQuickAddToPlaylist = {
+                            if (!viewModel.quickAddToLastPlaylist(track)) {
+                                viewModel.setSelectedTrackForAddToPlaylist(track)
+                            }
+                        },
                         onOptionsClick = { viewModel.setSelectedTrackForOptions(track) }
                     )
                 }
@@ -270,7 +276,6 @@ fun LikedSongsScreen(
                 onAddToQueue = { viewModel.addBatchToQueue(selectedTracks) },
                 onAddToPlaylist = { showAddToPlaylistDialog = true },
                 onToggleLike = { viewModel.removeBatchFromLiked(selectedTrackIds.toList()) },
-                onExport = { /* export if needed */ },
                 onRemove = { viewModel.removeBatchFromLiked(selectedTrackIds.toList()) },
                 modifier = Modifier.align(Alignment.BottomCenter)
             )
@@ -280,14 +285,13 @@ fun LikedSongsScreen(
             AddToPlaylistDialog(
                 playlists = allPlaylists,
                 onSelectPlaylist = { playlist ->
-                    val selectedTracks = likedTracks.filter { selectedTrackIds.contains(it.id) }
-                    selectedTracks.forEach { tr ->
-                        viewModel.addTrackToPlaylist(playlist.id, tr)
-                    }
+                    viewModel.batchAddSelectedSongsToPlaylist(playlist.id)
                     showAddToPlaylistDialog = false
-                    viewModel.clearSongSelection()
                 },
-                onDismiss = { showAddToPlaylistDialog = false }
+                onDismiss = { showAddToPlaylistDialog = false },
+                onCreatePlaylist = { name ->
+                    viewModel.createPlaylistAndAddSelectedSongs(name) { showAddToPlaylistDialog = false }
+                }
             )
         }
     }

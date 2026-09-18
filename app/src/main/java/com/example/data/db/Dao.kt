@@ -43,6 +43,9 @@ interface TrackDao {
     @Query("UPDATE tracks SET isLiked = :isLiked WHERE id = :id")
     suspend fun setLiked(id: String, isLiked: Boolean)
 
+    @Query("UPDATE tracks SET isLiked = :isLiked WHERE id IN (:ids)")
+    suspend fun batchSetLiked(ids: List<String>, isLiked: Boolean)
+
     @Query("UPDATE tracks SET playCount = playCount + 1, lastPlayedAt = :timestamp WHERE id = :id")
     suspend fun recordPlayback(id: String, timestamp: Long)
 
@@ -79,6 +82,12 @@ interface PlaylistDao {
     @Query("SELECT * FROM playlists WHERE name = :name LIMIT 1")
     suspend fun getPlaylistByName(name: String): PlaylistEntity?
 
+    @Query("SELECT * FROM playlists WHERE name = :name AND folderId = :folderId LIMIT 1")
+    suspend fun getPlaylistByNameInFolder(name: String, folderId: String): PlaylistEntity?
+
+    @Query("SELECT * FROM playlists WHERE name = :name AND folderId IS NULL LIMIT 1")
+    suspend fun getRootPlaylistByName(name: String): PlaylistEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertPlaylist(playlist: PlaylistEntity)
 
@@ -103,6 +112,9 @@ interface PlaylistDao {
     @Query("SELECT * FROM playlist_tracks WHERE playlistId = :playlistId ORDER BY orderIndex ASC")
     suspend fun getPlaylistEntriesSnapshot(playlistId: String): List<PlaylistTrackEntity>
 
+    @Query("SELECT trackId FROM playlist_tracks WHERE playlistId = :playlistId AND trackId IS NOT NULL")
+    suspend fun getPlaylistTrackIds(playlistId: String): List<String>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertPlaylistEntries(entries: List<PlaylistTrackEntity>)
 
@@ -111,6 +123,9 @@ interface PlaylistDao {
 
     @Query("DELETE FROM playlist_tracks WHERE entryId = :entryId")
     suspend fun deletePlaylistEntryById(entryId: Long)
+
+    @Query("DELETE FROM playlist_tracks WHERE entryId IN (:entryIds)")
+    suspend fun batchDeletePlaylistEntries(entryIds: List<Long>)
 
     @Update
     suspend fun updatePlaylistEntry(entry: PlaylistTrackEntity)

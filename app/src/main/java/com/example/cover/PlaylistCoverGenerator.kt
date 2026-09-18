@@ -31,22 +31,17 @@ object PlaylistCoverGenerator {
             return@withContext targetFile.absolutePath
         }
 
-        // Gather distinct album covers
-        val distinctCoverPaths = mutableListOf<String>()
-        val seenAlbums = mutableSetOf<String>()
-
-        for (track in tracks) {
-            val albumKey = track.album.ifBlank { track.artist }
-            if (track.coverPath != null && File(track.coverPath).exists()) {
-                if (albumKey.isNotBlank() && !seenAlbums.contains(albumKey)) {
-                    seenAlbums.add(albumKey)
-                    distinctCoverPaths.add(track.coverPath)
-                    if (distinctCoverPaths.size == 4) break
-                }
+        // Use the first four songs in playlist order that actually have cover art.
+        val coverPaths = tracks
+            .asSequence()
+            .mapNotNull { track ->
+                val path = track.coverPath
+                if (!path.isNullOrBlank() && File(path).exists()) path else null
             }
-        }
+            .take(4)
+            .toList()
 
-        if (distinctCoverPaths.isEmpty()) {
+        if (coverPaths.isEmpty()) {
             // Generate stylish dark music placeholder
             val placeholder = createDarkMusicPlaceholder()
             saveBitmap(placeholder, targetFile)
@@ -60,27 +55,27 @@ object PlaylistCoverGenerator {
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
-        when (distinctCoverPaths.size) {
+        when (coverPaths.size) {
             1 -> {
                 // Single cover
-                val b = loadBitmap(distinctCoverPaths[0])
+                val b = loadBitmap(coverPaths[0])
                 if (b != null) {
                     canvas.drawBitmap(b, null, Rect(0, 0, outputSize, outputSize), paint)
                 }
             }
             2 -> {
                 // 2-panel cover (split vertically)
-                val b1 = loadBitmap(distinctCoverPaths[0])
-                val b2 = loadBitmap(distinctCoverPaths[1])
+                val b1 = loadBitmap(coverPaths[0])
+                val b2 = loadBitmap(coverPaths[1])
                 val halfW = outputSize / 2
                 if (b1 != null) canvas.drawBitmap(b1, null, Rect(0, 0, halfW, outputSize), paint)
                 if (b2 != null) canvas.drawBitmap(b2, null, Rect(halfW, 0, outputSize, outputSize), paint)
             }
             3 -> {
                 // 3-panel cover: 1 full width top, 2 split bottom
-                val b1 = loadBitmap(distinctCoverPaths[0])
-                val b2 = loadBitmap(distinctCoverPaths[1])
-                val b3 = loadBitmap(distinctCoverPaths[2])
+                val b1 = loadBitmap(coverPaths[0])
+                val b2 = loadBitmap(coverPaths[1])
+                val b3 = loadBitmap(coverPaths[2])
                 val halfH = outputSize / 2
                 val halfW = outputSize / 2
                 if (b1 != null) canvas.drawBitmap(b1, null, Rect(0, 0, outputSize, halfH), paint)
@@ -88,11 +83,11 @@ object PlaylistCoverGenerator {
                 if (b3 != null) canvas.drawBitmap(b3, null, Rect(halfW, halfH, outputSize, outputSize), paint)
             }
             else -> {
-                // 4 distinct covers: 2x2 grid
-                val b1 = loadBitmap(distinctCoverPaths[0])
-                val b2 = loadBitmap(distinctCoverPaths[1])
-                val b3 = loadBitmap(distinctCoverPaths[2])
-                val b4 = loadBitmap(distinctCoverPaths[3])
+                // 4 song covers: 2x2 grid
+                val b1 = loadBitmap(coverPaths[0])
+                val b2 = loadBitmap(coverPaths[1])
+                val b3 = loadBitmap(coverPaths[2])
+                val b4 = loadBitmap(coverPaths[3])
                 val half = outputSize / 2
                 if (b1 != null) canvas.drawBitmap(b1, null, Rect(0, 0, half, half), paint)
                 if (b2 != null) canvas.drawBitmap(b2, null, Rect(half, 0, outputSize, half), paint)
@@ -140,4 +135,42 @@ object PlaylistCoverGenerator {
         canvas.drawText("🎵", size / 2f, size / 2f + 24f, paint)
         return bmp
     }
+
+    /**
+     * Gives a folder a cover chosen randomly from the covers of its child playlists.
+     * The cover is cached as folder_<folderId>.jpg so the UI can display it without
+     * adding another Room column or migration.
+     */
+    suspend fun generateRandomFolderCover(
+        context: Context,
+        folderId: String,
+        playlistCoverPaths: List<String>,
+        forceRegenerate: Boolean = false
+    ): String? = withContext(Dispatchers.IO) {
+        val valid = playlistCoverPaths.filter { path ->
+            path.isNotBlank() && File(path).exists() && File(path).isFile
+        }
+        if (valid.isEmpty()) return@withContext null
+
+        val coversDir = File(context.filesDir, "playlist_covers").apply { mkdirs() }
+        val target = File(coversDir, "folder_$folderId.jpg")
+        if (target.exists() && target.length() > 0 && !forceRegenerate) {
+            return@withContext target.absolutePath
+        }
+
+        val source = valid.shuffled().first()
+        try {
+            // Decode/re-encode to keep a private cached image even if the playlist
+            // cover file changes later.
+            val bitmap = BitmapFactory.decodeFile(source) ?: return@withContext null
+            saveBitmap(bitmap, target)
+            return@withContext target.absolutePath
+        } catch (_: Exception) {
+            return@withContext null
+        }
+    }
+
+    fun folderCoverPath(context: Context, folderId: String): String =
+        File(File(context.filesDir, "playlist_covers"), "folder_$folderId.jpg").absolutePath
+
 }

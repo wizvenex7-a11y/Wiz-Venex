@@ -1,5 +1,5 @@
 {
-  "name": "Local Music Player",
+  "name": "Spotify",
   "description": "Offline local music player with Spotify-inspired UI, TXT/CSV playlist importer with smart matcher, playlist folders, and background playback.",
   "requestFramePermissions": [],
   "majorCapabilities": [

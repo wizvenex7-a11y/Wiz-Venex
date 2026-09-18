@@ -119,7 +119,7 @@ object MusicScanner {
     /**
      * Scans MediaStore Audio library on device
      */
-    suspend fun scanMediaStore(context: Context): List<TrackEntity> = withContext(Dispatchers.IO) {
+    suspend fun scanMediaStore(context: Context, extractArtwork: Boolean = true): List<TrackEntity> = withContext(Dispatchers.IO) {
         val tracks = mutableListOf<TrackEntity>()
         val projection = arrayOf(
             MediaStore.Audio.Media._ID,
@@ -185,7 +185,7 @@ object MusicScanner {
                 }
 
                 var coverPath: String? = null
-                if (path.isNotEmpty() && File(path).exists()) {
+                if (extractArtwork && path.isNotEmpty() && File(path).exists()) {
                     coverPath = extractAndCacheArtwork(context, path, "ms_$mediaId")
                 }
 

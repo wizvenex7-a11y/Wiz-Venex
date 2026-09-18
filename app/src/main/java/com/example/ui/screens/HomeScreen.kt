@@ -238,7 +238,7 @@ fun HomeScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "Imported Music (${allTracks.size})",
+                        text = "Local Songs (${allTracks.size})",
                         color = SpotifyPrimaryText,
                         fontSize = 20.sp,
                         fontWeight = FontWeight.Bold
@@ -291,6 +291,11 @@ fun HomeScreen(
                     },
                     onTrackClick = { viewModel.playTrack(track, allTracks) },
                     onLikeToggle = { viewModel.toggleLike(track) },
+                    onQuickAddToPlaylist = {
+                        if (!viewModel.quickAddToLastPlaylist(track)) {
+                            viewModel.setSelectedTrackForAddToPlaylist(track)
+                        }
+                    },
                     onOptionsClick = { viewModel.setSelectedTrackForOptions(track) }
                 )
             }
@@ -314,9 +319,6 @@ fun HomeScreen(
                 onAddToQueue = { viewModel.addBatchToQueue(selectedTracks) },
                 onAddToPlaylist = { showAddToPlaylistDialog = true },
                 onToggleLike = { viewModel.batchLikeSelectedSongs(true) }, // Like all selected
-                onExport = { /* export selection */ },
-                onRemove = { viewModel.batchDeleteSelectedSongsFromLibrary() }, // Delete from library
-                onCheckDuplicates = { viewModel.batchCheckAndCleanDuplicates(selectedTrackIds.toList()) }, // Fast clean duplicates
                 modifier = Modifier.align(Alignment.BottomCenter)
             )
         }
@@ -325,14 +327,13 @@ fun HomeScreen(
             AddToPlaylistDialog(
                 playlists = allPlaylists,
                 onSelectPlaylist = { playlist ->
-                    val selectedTracks = allTracks.filter { selectedTrackIds.contains(it.id) }
-                    selectedTracks.forEach { tr ->
-                        viewModel.addTrackToPlaylist(playlist.id, tr)
-                    }
+                    viewModel.batchAddSelectedSongsToPlaylist(playlist.id)
                     showAddToPlaylistDialog = false
-                    viewModel.clearSongSelection()
                 },
-                onDismiss = { showAddToPlaylistDialog = false }
+                onDismiss = { showAddToPlaylistDialog = false },
+                onCreatePlaylist = { name ->
+                    viewModel.createPlaylistAndAddSelectedSongs(name) { showAddToPlaylistDialog = false }
+                }
             )
         }
     }

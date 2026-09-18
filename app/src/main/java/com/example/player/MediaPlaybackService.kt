@@ -35,21 +35,9 @@ class MediaPlaybackService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val player = AudioPlayerManager.getInstance(applicationContext)
-        val track = player.currentTrack.value
-        if (track != null) {
-            val isPlaying = player.isPlaying.value
-            val notification = buildNotification(track, isPlaying)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                try {
-                    startForeground(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-                } catch (_: Exception) {
-                    startForeground(NOTIFICATION_ID, notification)
-                }
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-        }
 
+        // Apply the requested action before rebuilding the notification so the icon/text
+        // always represent the current playback state (Play when paused, Pause when playing).
         when (intent?.action) {
             ACTION_PLAY_PAUSE -> player.togglePlayPause()
             ACTION_NEXT -> player.skipNext()
@@ -58,15 +46,48 @@ class MediaPlaybackService : Service() {
                 player.release()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
+                return START_NOT_STICKY
             }
         }
+
+        publishCurrentNotification(player)
         return START_STICKY
+    }
+
+    private fun publishCurrentNotification(player: AudioPlayerManager) {
+        val track = player.currentTrack.value
+        if (track == null) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            return
+        }
+        val notification = buildNotification(track, player.isPlaying.value)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                )
+            } catch (_: Exception) {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         val player = AudioPlayerManager.getInstance(applicationContext)
-        if (!player.isPlaying.value) {
+        val track = player.currentTrack.value
+
+        // Removing the app task pauses playback and keeps the media notification in Play state.
+        // Android force-stop terminates the process without running app callbacks; no app-side
+        // code can update a notification after a force-stop.
+        if (track != null) {
+            player.pausePlayback()
+            publishCurrentNotification(player)
+        } else {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -78,9 +99,7 @@ class MediaPlaybackService : Service() {
             val player = AudioPlayerManager.getInstance(applicationContext)
             player.currentTrack.collectLatest { track ->
                 if (track != null) {
-                    val isPlaying = player.isPlaying.value
-                    val notification = buildNotification(track, isPlaying)
-                    startForeground(NOTIFICATION_ID, notification)
+                    publishCurrentNotification(player)
                 } else {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                 }

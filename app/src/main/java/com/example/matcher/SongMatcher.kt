@@ -3,7 +3,6 @@ package com.example.matcher
 import com.example.data.model.TrackEntity
 import com.example.util.CsvTrackRow
 import com.example.util.NormalizationUtils
-import com.example.util.TxtTrackRow
 import kotlin.math.abs
 
 sealed class MatchResult {
@@ -22,7 +21,7 @@ enum class MatchConfidence {
 }
 
 /**
- * High-performance indexed track matcher for fast batch CSV & TXT playlist imports.
+ * High-performance indexed track matcher for fast batch CSV playlist imports.
  */
 class FastTrackMatcher(localTracks: List<TrackEntity>) {
     private val poolTracks = localTracks.filterNot {
@@ -59,56 +58,7 @@ class FastTrackMatcher(localTracks: List<TrackEntity>) {
         }
     }
 
-    fun matchTxtTrack(txtTrack: TxtTrackRow, toleranceMs: Long = 3000L): MatchResult {
-        if (poolTracks.isEmpty()) return MatchResult.NoMatch
 
-        val normTargetArtist = NormalizationUtils.pythonNormalize(txtTrack.artist)
-        val normTargetTitle = NormalizationUtils.pythonNormalize(txtTrack.title)
-        val cleanTargetTitleNorm = NormalizationUtils.pythonNormalize(NormalizationUtils.cleanSongTitle(txtTrack.title))
-        val targetKey = NormalizationUtils.songKey(txtTrack.artist, txtTrack.title)
-
-        fun matchesDuration(dur: Long): Boolean {
-            if (txtTrack.durationMs <= 0L) return true
-            return abs(dur - txtTrack.durationMs) <= toleranceMs
-        }
-
-        // 1. Direct Hash Match by songKey
-        val exactMatches = exactKeyMap[targetKey]?.filter { matchesDuration(it.durationMs) }
-        if (!exactMatches.isNullOrEmpty()) {
-            val closest = exactMatches.minByOrNull { abs(it.durationMs - txtTrack.durationMs) } ?: exactMatches.first()
-            return MatchResult.SingleMatch(closest, MatchConfidence.EXACT_TITLE_ARTIST_DURATION)
-        }
-
-        // 2. Lookup by clean title or norm title
-        val titleCandidates = mutableListOf<TrackEntity>()
-        normTitleMap[normTargetTitle]?.let { titleCandidates.addAll(it) }
-        cleanTitleMap[cleanTargetTitleNorm]?.let { titleCandidates.addAll(it) }
-
-        val validMatches = titleCandidates.distinctBy { it.id }.filter { local ->
-            val normLocalArtist = NormalizationUtils.pythonNormalize(local.artist)
-            val artistMatches = normLocalArtist == normTargetArtist ||
-                    normLocalArtist.contains(normTargetArtist) ||
-                    normTargetArtist.contains(normLocalArtist) ||
-                    normTargetArtist.isEmpty()
-            artistMatches && matchesDuration(local.durationMs)
-        }
-
-        if (validMatches.isNotEmpty()) {
-            val closest = validMatches.minByOrNull { abs(it.durationMs - txtTrack.durationMs) } ?: validMatches.first()
-            return MatchResult.SingleMatch(closest, MatchConfidence.EXACT_TITLE_ARTIST_DURATION)
-        }
-
-        // 3. Relaxed duration match for exact key (up to 6s tolerance)
-        val relaxedKeyMatches = exactKeyMap[targetKey]?.filter {
-            txtTrack.durationMs <= 0L || abs(it.durationMs - txtTrack.durationMs) <= 6000L
-        }
-        if (!relaxedKeyMatches.isNullOrEmpty()) {
-            val closest = relaxedKeyMatches.minByOrNull { abs(it.durationMs - txtTrack.durationMs) } ?: relaxedKeyMatches.first()
-            return MatchResult.SingleMatch(closest, MatchConfidence.TITLE_ARTIST_TOLERANT_DURATION)
-        }
-
-        return MatchResult.NoMatch
-    }
 
     fun matchCsvTrack(csvTrack: CsvTrackRow): MatchResult {
         if (poolTracks.isEmpty()) return MatchResult.NoMatch
@@ -229,13 +179,7 @@ class FastTrackMatcher(localTracks: List<TrackEntity>) {
 }
 
 object SongMatcher {
-    fun matchTxtTrack(
-        txtTrack: TxtTrackRow,
-        localTracks: List<TrackEntity>,
-        toleranceMs: Long = 3000L
-    ): MatchResult {
-        return FastTrackMatcher(localTracks).matchTxtTrack(txtTrack, toleranceMs)
-    }
+
 
     fun matchCsvTrack(
         csvTrack: CsvTrackRow,

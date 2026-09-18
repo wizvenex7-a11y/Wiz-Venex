@@ -73,7 +73,9 @@ object SortUtils {
         sortOrder: PlaylistSortOrder,
         countsMap: Map<String, Int> = emptyMap()
     ): List<PlaylistEntity> {
-        return when (sortOrder) {
+        // Pinned playlists always stay at the top, while the selected sort order
+        // controls the ordering within the pinned and unpinned groups.
+        val sorted = when (sortOrder) {
             PlaylistSortOrder.NAME_A_Z -> playlists.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
             PlaylistSortOrder.NAME_Z_A -> playlists.sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.name })
             PlaylistSortOrder.RECENTLY_UPDATED -> playlists.sortedByDescending { it.updatedAt }
@@ -81,5 +83,6 @@ object SortUtils {
             PlaylistSortOrder.TRACK_COUNT_DESC -> playlists.sortedByDescending { countsMap[it.id] ?: 0 }
             PlaylistSortOrder.TRACK_COUNT_ASC -> playlists.sortedBy { countsMap[it.id] ?: 0 }
         }
+        return sorted.sortedByDescending { it.isPinned }
     }
 }

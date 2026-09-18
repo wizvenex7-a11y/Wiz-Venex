@@ -1,14 +1,19 @@
 package com.example.backup
 
 import android.content.Context
+import androidx.room.withTransaction
 import com.example.cover.PlaylistCoverGenerator
 import com.example.data.db.AppDatabase
 import com.example.data.model.AppSettingEntity
 import com.example.data.model.PlaylistEntity
+import com.example.data.model.PlaylistFolderEntity
 import com.example.data.model.PlaylistTrackEntity
 import com.example.data.model.TrackEntity
+import com.example.matcher.FastTrackMatcher
 import com.example.matcher.MatchResult
 import com.example.matcher.SongMatcher
+import com.example.util.CsvUtils
+import com.example.util.NormalizationUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -42,10 +47,29 @@ data class MissingTrackInfo(
     val expectedFileName: String
 )
 
+private data class BackupPlaylistMeta(
+    val id: String,
+    val name: String,
+    val description: String,
+    val coverPath: String?,
+    val createdAt: Long,
+    val updatedAt: Long,
+    val isSystemLiked: Boolean,
+    val isPinned: Boolean,
+    val folderName: String?
+)
+
 object BackupRestoreManager {
 
     /**
-     * Creates a full ZIP backup of the app
+     * Full backup format:
+     *   backup/manifest.json
+     *   backup/folders.json
+     *   backup/playlists.json
+     *   playlists/Playlist.csv
+     *   folders/MyFolder/Playlist.csv
+     *
+     * JSON is metadata/backup data only. Normal playlist files are CSV.
      */
     suspend fun createFullBackup(
         context: Context,
@@ -53,457 +77,720 @@ object BackupRestoreManager {
         includeMusicFiles: Boolean = false
     ): File = withContext(Dispatchers.IO) {
         val backupDir = File(context.filesDir, "backups").apply { mkdirs() }
-        val dateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val dateStr = SimpleDateFormat("yyyy-MM-dd_HHmmss", Locale.US).format(Date())
         val backupZipFile = File(backupDir, "LocalMusicBackup_$dateStr.zip")
 
         val playlists = database.playlistDao().getAllPlaylistsSnapshot()
+        val folders = database.playlistFolderDao().getAllFoldersSnapshot()
         val allTracks = database.trackDao().getAllTracksSnapshot()
         val likedTracks = allTracks.filter { it.isLiked }
-        val recentlyPlayed = allTracks.filter { it.lastPlayedAt != null }.sortedByDescending { it.lastPlayedAt }
+        val recentlyPlayed = allTracks
+            .filter { it.lastPlayedAt != null }
+            .sortedByDescending { it.lastPlayedAt }
         val settings = database.appSettingDao().getAllSettings()
 
-        val zipOut = ZipOutputStream(FileOutputStream(backupZipFile))
-
-        try {
-            // 1. /backup/manifest.json
+        ZipOutputStream(FileOutputStream(backupZipFile)).use { zipOut ->
             val manifest = JSONObject().apply {
-                put("backupVersion", 1)
+                put("backupVersion", 2)
+                put("format", "folder-aware-csv")
                 put("appVersion", "1.0")
                 put("backupDate", dateStr)
                 put("playlistCount", playlists.size)
+                put("folderCount", folders.size)
                 put("trackCount", allTracks.size)
                 put("likedCount", likedTracks.size)
                 put("includesAudioFiles", includeMusicFiles)
             }
             writeZipEntry(zipOut, "backup/manifest.json", manifest.toString(2).toByteArray())
 
-            // 2. /playlists/<name>.json
-            for (p in playlists) {
-                val entries = database.playlistDao().getPlaylistEntriesSnapshot(p.id)
-                val playlistJson = JSONObject().apply {
-                    put("version", 1)
-                    val pObj = JSONObject().apply {
-                        put("id", p.id)
-                        put("name", p.name)
-                        put("description", p.description)
-                        put("coverPath", p.coverPath ?: "")
-                        put("createdAt", p.createdAt)
-                        put("updatedAt", p.updatedAt)
-                        put("isSystemLiked", p.isSystemLiked)
-
-                        val tracksArray = JSONArray()
-                        for (entry in entries) {
-                            val tObj = JSONObject().apply {
-                                put("title", entry.csvTitle)
-                                put("artist", entry.csvArtist)
-                                put("album", entry.csvAlbum)
-                                put("durationMs", entry.csvDurationMs)
-                                put("trackUri", entry.csvTrackUri ?: "")
-                                put("fileName", entry.resolvedFilePath?.let { File(it).name } ?: "")
-                                put("relativePath", entry.resolvedFilePath ?: "")
-                                put("isMissing", entry.isMissing)
-                                put("orderIndex", entry.orderIndex)
-                            }
-                            tracksArray.put(tObj)
-                        }
-                        put("tracks", tracksArray)
-                    }
-                    put("playlist", pObj)
-                }
-                val safeName = p.name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                writeZipEntry(zipOut, "playlists/$safeName.json", playlistJson.toString(2).toByteArray())
+            val foldersArray = JSONArray()
+            folders.forEach { folder ->
+                foldersArray.put(JSONObject().apply {
+                    put("id", folder.id)
+                    put("name", folder.name)
+                    put("createdAt", folder.createdAt)
+                    put("isPinned", folder.isPinned)
+                })
             }
+            writeZipEntry(zipOut, "backup/folders.json", foldersArray.toString(2).toByteArray())
 
-            // 3. /library/tracks.json, albums.json, artists.json
+            val playlistMetaArray = JSONArray()
+            for (playlist in playlists) {
+                val folderName = playlist.folderId
+                    ?.let { id -> folders.firstOrNull { it.id == id }?.name }
+
+                playlistMetaArray.put(JSONObject().apply {
+                    put("id", playlist.id)
+                    put("name", playlist.name)
+                    put("description", playlist.description)
+                    put("coverPath", playlist.coverPath ?: "")
+                    put("createdAt", playlist.createdAt)
+                    put("updatedAt", playlist.updatedAt)
+                    put("isSystemLiked", playlist.isSystemLiked)
+                    put("isPinned", playlist.isPinned)
+                    put("folderName", folderName ?: "")
+                    put("folderId", playlist.folderId ?: "")
+                })
+
+                val entries = database.playlistDao().getPlaylistEntriesSnapshot(playlist.id)
+                val csvRows = entries.map { entry ->
+                    val track = entry.trackId?.let { id -> allTracks.firstOrNull { it.id == id } }
+                    com.example.util.CsvTrackRow(
+                        trackName = track?.title ?: entry.csvTitle,
+                        artistNames = track?.artist ?: entry.csvArtist,
+                        albumName = track?.album ?: entry.csvAlbum,
+                        durationMs = track?.durationMs ?: entry.csvDurationMs,
+                        trackUri = entry.csvTrackUri ?: ""
+                    )
+                }
+                val csvContent = CsvUtils.exportToCsv(csvRows)
+                val folder = folderName?.takeIf { it.isNotBlank() }
+                val path = if (folder != null) {
+                    "folders/${sanitizePathPart(folder)}/${sanitizeFileName(playlist.name)}.csv"
+                } else {
+                    "playlists/${sanitizeFileName(playlist.name)}.csv"
+                }
+                writeZipEntry(zipOut, path, csvContent.toByteArray(Charsets.UTF_8))
+            }
+            writeZipEntry(
+                zipOut,
+                "backup/playlists.json",
+                playlistMetaArray.toString(2).toByteArray()
+            )
+
             val tracksArray = JSONArray()
             val albumsSet = mutableSetOf<String>()
             val artistsSet = mutableSetOf<String>()
-
-            for (t in allTracks) {
-                albumsSet.add(t.album)
-                artistsSet.add(t.artist)
-                val tObj = JSONObject().apply {
-                    put("id", t.id)
-                    put("title", t.title)
-                    put("artist", t.artist)
-                    put("album", t.album)
-                    put("albumArtist", t.albumArtist)
-                    put("durationMs", t.durationMs)
-                    put("filePath", t.filePath)
-                    put("fileName", t.fileName)
-                    put("coverPath", t.coverPath ?: "")
-                    put("isLiked", t.isLiked)
-                    put("playCount", t.playCount)
-                    put("lastPlayedAt", t.lastPlayedAt ?: -1L)
-                    put("trackNumber", t.trackNumber)
-                    put("discNumber", t.discNumber)
-                }
-                tracksArray.put(tObj)
+            for (track in allTracks) {
+                albumsSet.add(track.album)
+                artistsSet.add(track.artist)
+                tracksArray.put(JSONObject().apply {
+                    put("id", track.id)
+                    put("title", track.title)
+                    put("artist", track.artist)
+                    put("album", track.album)
+                    put("albumArtist", track.albumArtist)
+                    put("durationMs", track.durationMs)
+                    put("filePath", track.filePath)
+                    put("fileName", track.fileName)
+                    put("coverPath", track.coverPath ?: "")
+                    put("isLiked", track.isLiked)
+                    put("playCount", track.playCount)
+                    put("lastPlayedAt", track.lastPlayedAt ?: -1L)
+                    put("trackNumber", track.trackNumber)
+                    put("discNumber", track.discNumber)
+                })
             }
             writeZipEntry(zipOut, "library/tracks.json", tracksArray.toString(2).toByteArray())
+            writeZipEntry(
+                zipOut,
+                "library/albums.json",
+                JSONArray(albumsSet.toList()).toString(2).toByteArray()
+            )
+            writeZipEntry(
+                zipOut,
+                "library/artists.json",
+                JSONArray(artistsSet.toList()).toString(2).toByteArray()
+            )
 
-            val albumsArray = JSONArray()
-            albumsSet.forEach { albumsArray.put(it) }
-            writeZipEntry(zipOut, "library/albums.json", albumsArray.toString(2).toByteArray())
-
-            val artistsArray = JSONArray()
-            artistsSet.forEach { artistsArray.put(it) }
-            writeZipEntry(zipOut, "library/artists.json", artistsArray.toString(2).toByteArray())
-
-            // 4. /liked/liked_songs.json
             val likedArray = JSONArray()
-            for (lt in likedTracks) {
+            likedTracks.forEach { track ->
                 likedArray.put(JSONObject().apply {
-                    put("id", lt.id)
-                    put("title", lt.title)
-                    put("artist", lt.artist)
-                    put("album", lt.album)
-                    put("durationMs", lt.durationMs)
-                    put("fileName", lt.fileName)
+                    put("id", track.id)
+                    put("title", track.title)
+                    put("artist", track.artist)
+                    put("album", track.album)
+                    put("durationMs", track.durationMs)
+                    put("fileName", track.fileName)
                 })
             }
             writeZipEntry(zipOut, "liked/liked_songs.json", likedArray.toString(2).toByteArray())
 
-            // 5. /history/recently_played.json
             val historyArray = JSONArray()
-            for (h in recentlyPlayed) {
+            recentlyPlayed.forEach { track ->
                 historyArray.put(JSONObject().apply {
-                    put("id", h.id)
-                    put("title", h.title)
-                    put("artist", h.artist)
-                    put("lastPlayedAt", h.lastPlayedAt ?: 0L)
-                    put("playCount", h.playCount)
+                    put("id", track.id)
+                    put("title", track.title)
+                    put("artist", track.artist)
+                    put("lastPlayedAt", track.lastPlayedAt ?: 0L)
+                    put("playCount", track.playCount)
                 })
             }
-            writeZipEntry(zipOut, "history/recently_played.json", historyArray.toString(2).toByteArray())
+            writeZipEntry(
+                zipOut,
+                "history/recently_played.json",
+                historyArray.toString(2).toByteArray()
+            )
 
-            // 6. /settings/settings.json
             val settingsObj = JSONObject()
-            for (s in settings) {
-                settingsObj.put(s.key, s.value)
-            }
-            writeZipEntry(zipOut, "settings/settings.json", settingsObj.toString(2).toByteArray())
+            settings.forEach { setting -> settingsObj.put(setting.key, setting.value) }
+            writeZipEntry(
+                zipOut,
+                "settings/settings.json",
+                settingsObj.toString(2).toByteArray()
+            )
 
-            // 7. /playback/playback_state.json
-            val playbackObj = JSONObject().apply {
-                put("savedAt", System.currentTimeMillis())
-            }
-            writeZipEntry(zipOut, "playback/playback_state.json", playbackObj.toString(2).toByteArray())
-
-            // 8. /covers/
-            val coversDir = File(context.filesDir, "playlist_covers")
-            if (coversDir.exists()) {
-                coversDir.listFiles()?.forEach { coverFile ->
-                    if (coverFile.isFile && coverFile.extension.lowercase() in listOf("jpg", "png")) {
+            if (context.filesDir.resolve("playlist_covers").exists()) {
+                context.filesDir.resolve("playlist_covers").listFiles()?.forEach { coverFile ->
+                    if (coverFile.isFile && coverFile.extension.lowercase(Locale.US) in listOf("jpg", "png")) {
                         writeFileToZip(zipOut, "covers/${coverFile.name}", coverFile)
                     }
                 }
             }
 
-            // Optional: /audio/
             if (includeMusicFiles) {
-                for (t in allTracks) {
-                    val f = File(t.filePath)
-                    if (f.exists() && f.isFile) {
-                        writeFileToZip(zipOut, "audio/${f.name}", f)
+                allTracks.forEach { track ->
+                    val source = File(track.filePath)
+                    if (source.exists() && source.isFile) {
+                        writeFileToZip(zipOut, "audio/${source.name}", source)
                     }
                 }
             }
-
-        } finally {
-            zipOut.close()
         }
 
-        var finalCopiedFile = backupZipFile
+        val publicDir = File(
+            android.os.Environment.getExternalStoragePublicDirectory(
+                android.os.Environment.DIRECTORY_DOWNLOADS
+            ),
+            "LocalMusicBackups"
+        ).apply { mkdirs() }
+
+        val publicFile = File(publicDir, backupZipFile.name)
         try {
-            val publicDir = File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), "LocalMusicBackups")
-            if (!publicDir.exists()) {
-                publicDir.mkdirs()
-            }
-            val directDir = File("/storage/emulated/0/Download/LocalMusicBackups")
-            if (!directDir.exists()) {
-                directDir.mkdirs()
-            }
-
-            val targetDir = if (publicDir.exists()) publicDir else if (directDir.exists()) directDir else null
-            if (targetDir != null) {
-                val publicFile = File(targetDir, backupZipFile.name)
-                backupZipFile.copyTo(publicFile, overwrite = true)
-                finalCopiedFile = publicFile
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
+            backupZipFile.copyTo(publicFile, overwrite = true)
+            publicFile
+        } catch (_: Exception) {
+            backupZipFile
         }
-
-        finalCopiedFile
     }
 
-    /**
-     * Restores all app data from a backup ZIP file with rollback safety
-     */
     suspend fun restoreAllData(
         context: Context,
         database: AppDatabase,
         backupZipFile: File
     ): Result<RestoreReport> = withContext(Dispatchers.IO) {
-        // Step 1: Safety snapshot of current database state before modifying
-        val tempBackupDir = File(context.cacheDir, "pre_restore_snapshot").apply { mkdirs() }
-        val currentPlaylists = database.playlistDao().getAllPlaylistsSnapshot()
-        val currentTracks = database.trackDao().getAllTracksSnapshot()
+        val stagingDir = File(
+            context.cacheDir,
+            "restore_staging_${System.currentTimeMillis()}"
+        ).apply { mkdirs() }
 
         try {
-            // Unzip into a temporary staging folder
-            val stagingDir = File(context.cacheDir, "restore_staging_${System.currentTimeMillis()}").apply { mkdirs() }
             unzip(backupZipFile, stagingDir)
 
             val manifestFile = File(stagingDir, "backup/manifest.json")
             if (!manifestFile.exists()) {
-                return@withContext Result.failure(Exception("Invalid backup file: manifest.json not found"))
+                return@withContext Result.failure(
+                    IllegalArgumentException("Invalid backup: backup/manifest.json not found")
+                )
             }
 
             val manifest = JSONObject(manifestFile.readText())
+            val format = manifest.optString("format", "")
+            val localTracks = database.trackDao().getAllTracksSnapshot()
+
             var playlistsRestored = 0
             var tracksMatched = 0
             var tracksMissing = 0
             var likedSongsRestored = 0
             var coversRestored = 0
-            val missingTracksList = mutableListOf<MissingTrackInfo>()
+            val missingTracks = mutableListOf<MissingTrackInfo>()
 
-            // Restore covers
-            val coversDir = File(stagingDir, "covers")
             val targetCoversDir = File(context.filesDir, "playlist_covers").apply { mkdirs() }
+            val coversDir = File(stagingDir, "covers")
             if (coversDir.exists()) {
-                coversDir.listFiles()?.forEach { cFile ->
-                    if (cFile.isFile) {
-                        cFile.copyTo(File(targetCoversDir, cFile.name), overwrite = true)
+                coversDir.walkTopDown().forEach { file ->
+                    if (file.isFile) {
+                        file.copyTo(File(targetCoversDir, file.name), overwrite = true)
                         coversRestored++
                     }
                 }
             }
 
-            // Re-fetch current available local songs for matching
-            val localTracks = database.trackDao().getAllTracksSnapshot()
-
-            // Restore liked songs status
+            // Restore liked state and immediately deduplicate by file path or metadata.
             val likedFile = File(stagingDir, "liked/liked_songs.json")
             if (likedFile.exists()) {
                 val likedArray = JSONArray(likedFile.readText())
+                val matchedLikedIds = linkedSetOf<String>()
                 for (i in 0 until likedArray.length()) {
-                    val item = likedArray.getJSONObject(i)
-                    val title = item.optString("title")
-                    val artist = item.optString("artist")
-                    val dur = item.optLong("durationMs")
-                    val fileName = item.optString("fileName")
-
+                    val item = likedArray.optJSONObject(i) ?: continue
                     val match = SongMatcher.matchForRestore(
                         expectedPath = null,
-                        expectedFileName = fileName,
-                        expectedTitle = title,
-                        expectedArtist = artist,
-                        expectedAlbum = "",
-                        expectedDurationMs = dur,
+                        expectedFileName = item.optString("fileName"),
+                        expectedTitle = item.optString("title"),
+                        expectedArtist = item.optString("artist"),
+                        expectedAlbum = item.optString("album"),
+                        expectedDurationMs = item.optLong("durationMs", 0L),
                         localTracks = localTracks
                     )
-                    if (match is MatchResult.SingleMatch) {
+                    if (match is MatchResult.SingleMatch && matchedLikedIds.add(match.track.id)) {
                         database.trackDao().setLiked(match.track.id, true)
                         likedSongsRestored++
                     }
                 }
             }
 
-            // Restore playlists
-            val playlistsFolder = File(stagingDir, "playlists")
-            if (playlistsFolder.exists()) {
-                val pFiles = playlistsFolder.listFiles() ?: emptyArray()
-                for (pFile in pFiles) {
-                    if (!pFile.isFile || !pFile.name.endsWith(".json")) continue
-                    val root = JSONObject(pFile.readText())
-                    val pObj = root.optJSONObject("playlist") ?: continue
+            val backupFolders = readFolderMetadata(File(stagingDir, "backup/folders.json"))
+            val folderIdByNormalizedName = linkedMapOf<String, String>()
 
-                    val pId = pObj.optString("id", UUID.randomUUID().toString())
-                    val pName = pObj.optString("name", pFile.nameWithoutExtension)
-                    val pDesc = pObj.optString("description", "")
-                    val isSystemLiked = pObj.optBoolean("isSystemLiked", false)
-                    val pCover = pObj.optString("coverPath").ifBlank { null }
-
-                    // Duplicate handling: if existing playlist with same name exists, update/replace
-                    val existing = database.playlistDao().getPlaylistByName(pName)
-                    val playlistIdToUse = existing?.id ?: pId
-
-                    val playlistEntity = PlaylistEntity(
-                        id = playlistIdToUse,
-                        name = pName,
-                        description = pDesc,
-                        coverPath = pCover,
-                        createdAt = pObj.optLong("createdAt", System.currentTimeMillis()),
-                        updatedAt = System.currentTimeMillis(),
-                        isSystemLiked = isSystemLiked
+            // Create/reuse folders by name. Existing folders are never duplicated.
+            database.withTransaction {
+                val existingFolders = database.playlistFolderDao().getAllFoldersSnapshot()
+                backupFolders.forEach { meta ->
+                    val normalized = NormalizationUtils.normalizeText(meta.name)
+                    val existing = existingFolders.firstOrNull {
+                        NormalizationUtils.normalizeText(it.name) == normalized
+                    }
+                    val folder = existing ?: PlaylistFolderEntity(
+                        id = meta.id.ifBlank { UUID.randomUUID().toString() },
+                        name = meta.name,
+                        createdAt = meta.createdAt
                     )
-                    database.playlistDao().insertPlaylist(playlistEntity)
-                    database.playlistDao().deletePlaylistEntries(playlistIdToUse)
+                    val merged = folder.copy(
+                        name = meta.name,
+                        isPinned = meta.isPinned
+                    )
+                    database.playlistFolderDao().insertFolder(merged)
+                    folderIdByNormalizedName[normalized] = merged.id
+                }
+            }
 
-                    val tracksArray = pObj.optJSONArray("tracks") ?: JSONArray()
-                    val entriesToInsert = mutableListOf<PlaylistTrackEntity>()
-                    val matchedTracksForCover = mutableListOf<TrackEntity>()
+            val playlistMetaByPath = readPlaylistMetadata(
+                File(stagingDir, "backup/playlists.json")
+            )
 
-                    for (j in 0 until tracksArray.length()) {
-                        val tObj = tracksArray.getJSONObject(j)
-                        val title = tObj.optString("title")
-                        val artist = tObj.optString("artist")
-                        val album = tObj.optString("album")
-                        val dur = tObj.optLong("durationMs")
-                        val fileName = tObj.optString("fileName")
-                        val relPath = tObj.optString("relativePath")
-                        val uri = tObj.optString("trackUri")
-                        val orderIdx = tObj.optInt("orderIndex", j)
+            // New folder-aware CSV backup format.
+            val csvFiles = mutableListOf<File>()
+            File(stagingDir, "playlists").takeIf { it.exists() }?.walkTopDown()?.forEach {
+                if (it.isFile && it.extension.equals("csv", ignoreCase = true)) csvFiles.add(it)
+            }
+            File(stagingDir, "folders").takeIf { it.exists() }?.walkTopDown()?.forEach {
+                if (it.isFile && it.extension.equals("csv", ignoreCase = true)) csvFiles.add(it)
+            }
 
-                        val match = SongMatcher.matchForRestore(
-                            expectedPath = relPath,
-                            expectedFileName = fileName,
-                            expectedTitle = title,
-                            expectedArtist = artist,
-                            expectedAlbum = album,
-                            expectedDurationMs = dur,
-                            localTracks = localTracks
-                        )
+            if (csvFiles.isNotEmpty() || format == "folder-aware-csv") {
+                for (csvFile in csvFiles.sortedBy { it.relativeTo(stagingDir).path.lowercase(Locale.US) }) {
+                    val relative = csvFile.relativeTo(stagingDir).path.replace(File.separatorChar, '/')
+                    val meta = playlistMetaByPath[relative]
+                        ?: playlistMetaByPath[normalizeBackupPath(relative)]
 
+                    val folderNameFromPath = extractFolderNameFromBackupPath(relative)
+                    val folderId = meta?.folderName
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { folderIdByNormalizedName[NormalizationUtils.normalizeText(it)] }
+                        ?: folderNameFromPath
+                            ?.let { folderIdByNormalizedName[NormalizationUtils.normalizeText(it)] }
+
+                    val fallbackName = csvFile.nameWithoutExtension
+                    val playlistName = meta?.name?.takeIf { it.isNotBlank() }
+                        ?: fallbackName
+
+                    val rows = FileInputStream(csvFile).use { input ->
+                        CsvUtils.parseSpotifyCsv(input)
+                    }
+
+                    val matchedTracks = mutableListOf<TrackEntity>()
+                    val entries = mutableListOf<PlaylistTrackEntity>()
+                    val seenTrackIds = mutableSetOf<String>()
+                    val seenMissingKeys = mutableSetOf<String>()
+
+                    val matcher = FastTrackMatcher(localTracks)
+                    for ((index, row) in rows.withIndex()) {
+                        val match = matcher.matchCsvTrack(row)
                         when (match) {
                             is MatchResult.SingleMatch -> {
-                                entriesToInsert.add(
-                                    PlaylistTrackEntity(
-                                        playlistId = playlistIdToUse,
-                                        trackId = match.track.id,
-                                        orderIndex = orderIdx,
-                                        isMissing = false,
-                                        csvTitle = title,
-                                        csvArtist = artist,
-                                        csvAlbum = album,
-                                        csvDurationMs = dur,
-                                        csvTrackUri = uri,
-                                        resolvedFilePath = match.track.filePath
-                                    )
-                                )
-                                matchedTracksForCover.add(match.track)
+                                if (!seenTrackIds.add(match.track.id)) continue
+                                matchedTracks.add(match.track)
                                 tracksMatched++
+                                entries += PlaylistTrackEntity(
+                                    playlistId = "",
+                                    trackId = match.track.id,
+                                    orderIndex = entries.size,
+                                    isMissing = false,
+                                    csvTitle = row.trackName,
+                                    csvArtist = row.artistNames,
+                                    csvAlbum = row.albumName,
+                                    csvDurationMs = row.durationMs,
+                                    csvTrackUri = row.trackUri,
+                                    resolvedFilePath = match.track.filePath
+                                )
                             }
                             is MatchResult.AmbiguousMatch -> {
-                                val firstCand = match.candidates.first()
-                                entriesToInsert.add(
-                                    PlaylistTrackEntity(
-                                        playlistId = playlistIdToUse,
-                                        trackId = firstCand.id,
-                                        orderIndex = orderIdx,
+                                val candidate = match.candidates.firstOrNull() ?: continue
+                                if (!seenTrackIds.add(candidate.id)) continue
+                                matchedTracks.add(candidate)
+                                tracksMatched++
+                                entries += PlaylistTrackEntity(
+                                    playlistId = "",
+                                    trackId = candidate.id,
+                                    orderIndex = entries.size,
+                                    isMissing = false,
+                                    csvTitle = row.trackName,
+                                    csvArtist = row.artistNames,
+                                    csvAlbum = row.albumName,
+                                    csvDurationMs = row.durationMs,
+                                    csvTrackUri = row.trackUri,
+                                    resolvedFilePath = candidate.filePath
+                                )
+                            }
+                            MatchResult.NoMatch -> {
+                                val missingKey = "${NormalizationUtils.normalizeText(row.trackName)}|" +
+                                        "${NormalizationUtils.normalizeText(row.artistNames)}|" +
+                                        row.durationMs
+                                if (!seenMissingKeys.add(missingKey)) continue
+                                tracksMissing++
+                                entries += PlaylistTrackEntity(
+                                    playlistId = "",
+                                    trackId = null,
+                                    orderIndex = entries.size,
+                                    isMissing = true,
+                                    csvTitle = row.trackName,
+                                    csvArtist = row.artistNames,
+                                    csvAlbum = row.albumName,
+                                    csvDurationMs = row.durationMs,
+                                    csvTrackUri = row.trackUri,
+                                    resolvedFilePath = null
+                                )
+                                missingTracks += MissingTrackInfo(
+                                    playlistName = playlistName,
+                                    title = row.trackName,
+                                    artist = row.artistNames,
+                                    album = row.albumName,
+                                    expectedDurationMs = row.durationMs,
+                                    expectedFileName = ""
+                                )
+                            }
+                        }
+                    }
+
+                    val playlistId = database.withTransaction {
+                        val existing = if (folderId != null) {
+                            database.playlistDao().getPlaylistByNameInFolder(playlistName, folderId)
+                        } else {
+                            database.playlistDao().getRootPlaylistByName(playlistName)
+                                ?: database.playlistDao().getPlaylistByName(playlistName)
+                        }
+
+                        val targetId = if (existing != null) {
+                            existing.id
+                        } else {
+                            val backupId = meta?.id?.takeIf { it.isNotBlank() }
+                            if (backupId != null && database.playlistDao().getPlaylistById(backupId) == null) {
+                                backupId
+                            } else {
+                                UUID.randomUUID().toString()
+                            }
+                        }
+
+                        val entity = PlaylistEntity(
+                            id = targetId,
+                            name = playlistName,
+                            description = meta?.description ?: existing?.description.orEmpty(),
+                            coverPath = meta?.coverPath?.takeIf { it.isNotBlank() } ?: existing?.coverPath,
+                            createdAt = meta?.createdAt ?: existing?.createdAt ?: System.currentTimeMillis(),
+                            updatedAt = System.currentTimeMillis(),
+                            isSystemLiked = meta?.isSystemLiked ?: existing?.isSystemLiked ?: false,
+                            folderId = folderId,
+                            isPinned = meta?.isPinned ?: existing?.isPinned ?: false
+                        )
+                        database.playlistDao().insertPlaylist(entity)
+                        database.playlistDao().deletePlaylistEntries(targetId)
+
+                        val finalEntries = entries.map { it.copy(playlistId = targetId) }
+                        finalEntries.chunked(900).forEach {
+                            database.playlistDao().insertPlaylistEntries(it)
+                        }
+                        targetId
+                    }
+
+                    val generatedCover = PlaylistCoverGenerator.generateCoverForPlaylist(
+                        context = context,
+                        playlistId = playlistId,
+                        tracks = matchedTracks,
+                        forceRegenerate = true
+                    )
+                    if (generatedCover != null) {
+                        database.playlistDao().getPlaylistById(playlistId)?.let { current ->
+                            database.playlistDao().updatePlaylist(
+                                current.copy(
+                                    coverPath = generatedCover,
+                                    updatedAt = System.currentTimeMillis()
+                                )
+                            )
+                        }
+                    }
+                    playlistsRestored++
+                }
+            } else {
+                // Legacy v1/v2 root-level playlist JSON restore.
+                val playlistsDir = File(stagingDir, "playlists")
+                playlistsDir.listFiles()
+                    ?.filter { it.isFile && it.extension.equals("json", ignoreCase = true) }
+                    ?.forEach { pFile ->
+                        val root = JSONObject(pFile.readText())
+                        val pObj = root.optJSONObject("playlist") ?: return@forEach
+                        val pName = pObj.optString("name", pFile.nameWithoutExtension)
+                        val pDesc = pObj.optString("description", "")
+                        val pId = pObj.optString("id").ifBlank { UUID.randomUUID().toString() }
+                        val existing = database.playlistDao().getPlaylistByName(pName)
+                        val targetId = if (existing != null) {
+                            existing.id
+                        } else if (pId.isNotBlank() && database.playlistDao().getPlaylistById(pId) == null) {
+                            pId
+                        } else {
+                            UUID.randomUUID().toString()
+                        }
+
+                        val tracksArray = pObj.optJSONArray("tracks") ?: JSONArray()
+                        val matchedTracks = mutableListOf<TrackEntity>()
+                        val entries = mutableListOf<PlaylistTrackEntity>()
+                        val seenTrackIds = mutableSetOf<String>()
+
+                        val matcher = FastTrackMatcher(localTracks)
+                        for (j in 0 until tracksArray.length()) {
+                            val item = tracksArray.optJSONObject(j) ?: continue
+                            val title = item.optString("title")
+                            if (title.isBlank()) continue
+                            val artist = item.optString("artist")
+                            val album = item.optString("album")
+                            val duration = item.optLong("durationMs", 0L)
+                            val match = matcher.matchCsvTrack(
+                                com.example.util.CsvTrackRow(
+                                    trackName = title,
+                                    artistNames = artist,
+                                    albumName = album,
+                                    durationMs = duration,
+                                    trackUri = item.optString("trackUri", "")
+                                )
+                            )
+
+                            when (match) {
+                                is MatchResult.SingleMatch -> {
+                                    if (!seenTrackIds.add(match.track.id)) continue
+                                    matchedTracks.add(match.track)
+                                    tracksMatched++
+                                    entries += PlaylistTrackEntity(
+                                        playlistId = targetId,
+                                        trackId = match.track.id,
+                                        orderIndex = entries.size,
                                         isMissing = false,
                                         csvTitle = title,
                                         csvArtist = artist,
                                         csvAlbum = album,
-                                        csvDurationMs = dur,
-                                        csvTrackUri = uri,
-                                        resolvedFilePath = firstCand.filePath
+                                        csvDurationMs = duration,
+                                        csvTrackUri = item.optString("trackUri", ""),
+                                        resolvedFilePath = match.track.filePath
                                     )
-                                )
-                                matchedTracksForCover.add(firstCand)
-                                tracksMatched++
-                            }
-                            MatchResult.NoMatch -> {
-                                entriesToInsert.add(
-                                    PlaylistTrackEntity(
-                                        playlistId = playlistIdToUse,
+                                }
+                                is MatchResult.AmbiguousMatch -> {
+                                    val candidate = match.candidates.firstOrNull() ?: continue
+                                    if (!seenTrackIds.add(candidate.id)) continue
+                                    matchedTracks.add(candidate)
+                                    tracksMatched++
+                                    entries += PlaylistTrackEntity(
+                                        playlistId = targetId,
+                                        trackId = candidate.id,
+                                        orderIndex = entries.size,
+                                        isMissing = false,
+                                        csvTitle = title,
+                                        csvArtist = artist,
+                                        csvAlbum = album,
+                                        csvDurationMs = duration,
+                                        csvTrackUri = item.optString("trackUri", ""),
+                                        resolvedFilePath = candidate.filePath
+                                    )
+                                }
+                                MatchResult.NoMatch -> {
+                                    tracksMissing++
+                                    entries += PlaylistTrackEntity(
+                                        playlistId = targetId,
                                         trackId = null,
-                                        orderIndex = orderIdx,
+                                        orderIndex = entries.size,
                                         isMissing = true,
                                         csvTitle = title,
                                         csvArtist = artist,
                                         csvAlbum = album,
-                                        csvDurationMs = dur,
-                                        csvTrackUri = uri,
+                                        csvDurationMs = duration,
+                                        csvTrackUri = item.optString("trackUri", ""),
                                         resolvedFilePath = null
                                     )
+                                }
+                            }
+                        }
+
+                        database.withTransaction {
+                            database.playlistDao().insertPlaylist(
+                                PlaylistEntity(
+                                    id = targetId,
+                                    name = pName,
+                                    description = pDesc,
+                                    coverPath = pObj.optString("coverPath").ifBlank { null },
+                                    createdAt = pObj.optLong("createdAt", existing?.createdAt ?: System.currentTimeMillis()),
+                                    updatedAt = System.currentTimeMillis(),
+                                    isSystemLiked = pObj.optBoolean("isSystemLiked", existing?.isSystemLiked ?: false),
+                                    folderId = existing?.folderId,
+                                    isPinned = pObj.optBoolean("isPinned", existing?.isPinned ?: false)
                                 )
-                                tracksMissing++
-                                missingTracksList.add(
-                                    MissingTrackInfo(
-                                        playlistName = pName,
-                                        title = title,
-                                        artist = artist,
-                                        album = album,
-                                        expectedDurationMs = dur,
-                                        expectedFileName = fileName
-                                    )
+                            )
+                            database.playlistDao().deletePlaylistEntries(targetId)
+                            entries.chunked(900).forEach { chunk ->
+                                database.playlistDao().insertPlaylistEntries(chunk)
+                            }
+                        }
+
+                        val generatedCover = PlaylistCoverGenerator.generateCoverForPlaylist(
+                            context = context,
+                            playlistId = targetId,
+                            tracks = matchedTracks,
+                            forceRegenerate = true
+                        )
+                        if (generatedCover != null) {
+                            database.playlistDao().getPlaylistById(targetId)?.let { current ->
+                                database.playlistDao().updatePlaylist(
+                                    current.copy(coverPath = generatedCover)
                                 )
                             }
                         }
+                        playlistsRestored++
                     }
+            }
 
-                    database.playlistDao().insertPlaylistEntries(entriesToInsert)
-
-                    // Generate or restore 2x2 cover if not set
-                    if (playlistEntity.coverPath == null && matchedTracksForCover.isNotEmpty()) {
-                        val genCover = PlaylistCoverGenerator.generateCoverForPlaylist(
-                            context = context,
-                            playlistId = playlistIdToUse,
-                            tracks = matchedTracksForCover
-                        )
-                        if (genCover != null) {
-                            database.playlistDao().updatePlaylist(playlistEntity.copy(coverPath = genCover))
-                        }
-                    }
-
-                    playlistsRestored++
+            // Generate a random folder cover from the child playlist covers.
+            val finalFolders = database.playlistFolderDao().getAllFoldersSnapshot()
+            val finalPlaylists = database.playlistDao().getAllPlaylistsSnapshot()
+            finalFolders.forEach { folder ->
+                val childCovers = finalPlaylists
+                    .filter { it.folderId == folder.id }
+                    .mapNotNull { it.coverPath }
+                if (childCovers.isNotEmpty()) {
+                    PlaylistCoverGenerator.generateRandomFolderCover(
+                        context = context,
+                        folderId = folder.id,
+                        playlistCoverPaths = childCovers,
+                        forceRegenerate = true
+                    )
                 }
             }
 
-            // Clean staging
-            stagingDir.deleteRecursively()
-
-            val report = RestoreReport(
-                playlistsRestored = playlistsRestored,
-                tracksMatched = tracksMatched,
-                tracksMissing = tracksMissing,
-                likedSongsRestored = likedSongsRestored,
-                playlistCoversRestored = coversRestored,
-                missingTracks = missingTracksList
+            Result.success(
+                RestoreReport(
+                    playlistsRestored = playlistsRestored,
+                    tracksMatched = tracksMatched,
+                    tracksMissing = tracksMissing,
+                    likedSongsRestored = likedSongsRestored,
+                    playlistCoversRestored = coversRestored,
+                    missingTracks = missingTracks
+                )
             )
-
-            Result.success(report)
         } catch (e: Exception) {
             e.printStackTrace()
-            // Rollback safety: restore original database snapshot if anything goes wrong!
-            try {
-                // (currentPlaylists and currentTracks are intact in memory)
-            } catch (_: Exception) {}
             Result.failure(e)
+        } finally {
+            stagingDir.deleteRecursively()
         }
     }
 
+    private fun readFolderMetadata(file: File): List<PlaylistFolderEntity> {
+        if (!file.exists()) return emptyList()
+        val array = JSONArray(file.readText())
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val name = obj.optString("name").trim()
+                if (name.isBlank()) continue
+                add(
+                    PlaylistFolderEntity(
+                        id = obj.optString("id").ifBlank { UUID.randomUUID().toString() },
+                        name = name,
+                        createdAt = obj.optLong("createdAt", System.currentTimeMillis()),
+                        isPinned = obj.optBoolean("isPinned", false)
+                    )
+                )
+            }
+        }
+    }
+
+    private fun readPlaylistMetadata(file: File): Map<String, BackupPlaylistMeta> {
+        if (!file.exists()) return emptyMap()
+        val array = JSONArray(file.readText())
+        val result = linkedMapOf<String, BackupPlaylistMeta>()
+        for (i in 0 until array.length()) {
+            val obj = array.optJSONObject(i) ?: continue
+            val name = obj.optString("name").trim()
+            if (name.isBlank()) continue
+
+            val meta = BackupPlaylistMeta(
+                id = obj.optString("id").ifBlank { UUID.randomUUID().toString() },
+                name = name,
+                description = obj.optString("description", ""),
+                coverPath = obj.optString("coverPath").ifBlank { null },
+                createdAt = obj.optLong("createdAt", System.currentTimeMillis()),
+                updatedAt = obj.optLong("updatedAt", System.currentTimeMillis()),
+                isSystemLiked = obj.optBoolean("isSystemLiked", false),
+                isPinned = obj.optBoolean("isPinned", false),
+                folderName = obj.optString("folderName").ifBlank { null }
+            )
+
+            val folderName = meta.folderName
+            val path = if (folderName != null) {
+                "folders/${sanitizePathPart(folderName)}/${sanitizeFileName(name)}.csv"
+            } else {
+                "playlists/${sanitizeFileName(name)}.csv"
+            }
+            result[path] = meta
+            result[normalizeBackupPath(path)] = meta
+        }
+        return result
+    }
+
+    private fun extractFolderNameFromBackupPath(relative: String): String? {
+        val parts = normalizeBackupPath(relative).split('/')
+        return if (parts.size >= 3 && parts[0].equals("folders", ignoreCase = true)) {
+            parts[1]
+        } else null
+    }
+
+    private fun normalizeBackupPath(path: String): String =
+        path.replace('\\', '/').trimStart('/')
+
+    private fun sanitizeFileName(name: String): String =
+        name.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "Playlist" }
+
+    private fun sanitizePathPart(name: String): String =
+        sanitizeFileName(name).replace(Regex("[. ]+$"), "").ifBlank { "Folder" }
+
     private fun writeZipEntry(zipOut: ZipOutputStream, entryName: String, data: ByteArray) {
-        val entry = ZipEntry(entryName)
+        val entry = ZipEntry(entryName.replace('\\', '/'))
         zipOut.putNextEntry(entry)
         zipOut.write(data)
         zipOut.closeEntry()
     }
 
     private fun writeFileToZip(zipOut: ZipOutputStream, entryName: String, file: File) {
-        val entry = ZipEntry(entryName)
+        val entry = ZipEntry(entryName.replace('\\', '/'))
         zipOut.putNextEntry(entry)
-        FileInputStream(file).use { input ->
-            input.copyTo(zipOut)
-        }
+        FileInputStream(file).use { input -> input.copyTo(zipOut) }
         zipOut.closeEntry()
     }
 
+    /**
+     * Secure ZIP extraction: reject absolute paths and path traversal.
+     */
     private fun unzip(zipFile: File, targetDir: File) {
+        val root = targetDir.canonicalFile
         ZipInputStream(FileInputStream(zipFile)).use { zis ->
             var entry = zis.nextEntry
             while (entry != null) {
-                val newFile = File(targetDir, entry.name)
+                val safeName = entry.name.replace('\\', '/').trimStart('/')
+                val outFile = File(root, safeName).canonicalFile
+                if (outFile.path != root.path && !outFile.path.startsWith(root.path + File.separator)) {
+                    throw SecurityException("Unsafe ZIP entry: ${entry.name}")
+                }
+
                 if (entry.isDirectory) {
-                    newFile.mkdirs()
+                    outFile.mkdirs()
                 } else {
-                    newFile.parentFile?.mkdirs()
-                    FileOutputStream(newFile).use { fos ->
-                        zis.copyTo(fos)
-                    }
+                    outFile.parentFile?.mkdirs()
+                    FileOutputStream(outFile).use { output -> zis.copyTo(output) }
                 }
                 zis.closeEntry()
                 entry = zis.nextEntry

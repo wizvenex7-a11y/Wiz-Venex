@@ -62,10 +62,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.player.AudioPlayerManager
 import com.example.ui.MainViewModel
 import com.example.ui.Screen
 import com.example.ui.components.AddToPlaylistDialog
-import com.example.ui.components.DeleteConfirmationDialog
 import com.example.ui.components.DuplicatePlaylistDialog
 import com.example.ui.components.FullPlayerModal
 import com.example.ui.components.ImportSummaryDialog
@@ -97,6 +97,14 @@ class MainActivity : ComponentActivity() {
                 MainApp()
             }
         }
+    }
+
+    override fun onDestroy() {
+        // When the activity is actually closed, pause instead of leaving a stale Pause action.
+        if (isFinishing) {
+            AudioPlayerManager.getInstance(applicationContext).pausePlayback()
+        }
+        super.onDestroy()
     }
 }
 
@@ -151,7 +159,6 @@ fun MainApp(viewModel: MainViewModel = viewModel()) {
 
     val selectedTrackForOptions by viewModel.selectedTrackForOptions.collectAsState()
     val selectedTrackForAddToPlaylist by viewModel.selectedTrackForAddToPlaylist.collectAsState()
-    val isDeleteConfirmationVisible by viewModel.isDeleteConfirmationVisible.collectAsState()
     val allPlaylists by viewModel.allPlaylists.collectAsState()
     val activePlaylist by viewModel.activePlaylist.collectAsState()
 
@@ -419,9 +426,6 @@ fun MainApp(viewModel: MainViewModel = viewModel()) {
             onAddToQueue = {
                 track?.let { viewModel.addToQueue(it) }
                 viewModel.setSelectedTrackForOptions(null)
-            },
-            onDeleteFromLibrary = {
-                viewModel.showDeleteConfirmation(true)
             }
         )
     }
@@ -436,16 +440,10 @@ fun MainApp(viewModel: MainViewModel = viewModel()) {
                     viewModel.addTrackToPlaylist(p.id, track)
                 }
             },
-            onDismiss = { viewModel.setSelectedTrackForAddToPlaylist(null) }
-        )
-    }
-
-    // Delete Confirmation Dialog
-    if (isDeleteConfirmationVisible && selectedTrackForOptions != null) {
-        DeleteConfirmationDialog(
-            track = selectedTrackForOptions!!,
-            onConfirm = { viewModel.confirmDeleteTrackFromLibrary() },
-            onDismiss = { viewModel.showDeleteConfirmation(false) }
+            onDismiss = { viewModel.setSelectedTrackForAddToPlaylist(null) },
+            onCreatePlaylist = { name ->
+                if (track != null) viewModel.createPlaylistAndAddTrack(name, track) { viewModel.setSelectedTrackForAddToPlaylist(null) }
+            }
         )
     }
 
