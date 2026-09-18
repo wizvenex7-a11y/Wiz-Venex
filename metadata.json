@@ -1,0 +1,8 @@
+{
+  "name": "Local Music Player",
+  "description": "Offline local music player with Spotify-inspired UI, TXT/CSV playlist importer with smart matcher, playlist folders, and background playback.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
